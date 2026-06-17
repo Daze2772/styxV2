@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 from loguru import logger
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-from playwright_stealth import stealth_sync
+from playwright_stealth import Stealth
 
 def generate_random_string(length=10):
     """Generate a random alphanumeric string."""
@@ -228,7 +228,7 @@ def main():
         for url in urls:
             page = context.new_page()
             # Apply playwright-stealth to avoid bot detection
-            stealth_sync(page)
+            Stealth().apply_stealth_sync(page)
             try:
                 result = process_registration(page, url)
                 if result:
