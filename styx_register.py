@@ -1575,15 +1575,34 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None):
     before_n = (before_badge or {}).get("count") if before_badge else None
     logger.info(f"  header cart badge BEFORE click: {before_badge}")
 
-    # Click candidates in ranked order until the header cart badge
-    # increments (or the cart popup opens). This is the critical fix for
-    # the bug where the mail/message icon was clicked instead of the cart.
+    # Click candidates in ranked order. Verification strategy:
+    #
+    # The header cart badge on the seller-profile page does NOT auto-refresh
+    # after add-to-cart on Styx (the badge only updates on next navigation).
+    # So we can't rely on `badge.count++` as a synchronous verification - it
+    # often stays the same even after a successful add.
+    #
+    # Strategy:
+    #   * Tier 1 = `class*=cart` / `aria*=cart` candidate. The heuristic is
+    #     strict (excludes mail/star/etc), so a tier-1 hit is basically
+    #     guaranteed correct. We click, wait long enough for the server to
+    #     process (~6s), then proceed.
+    #   * Tier 2 = positional fallback (no cart-class match). Here we DO
+    #     need to verify, because we don't know we picked right. We poll
+    #     the badge for up to 20s and require a real increment, otherwise
+    #     dismiss any popup and try the next candidate.
+    #   * Failures in the header-cart step (next phase) catch the rare case
+    #     where the tier-1 click was visually right but the server rejected
+    #     it (out of stock, etc.) - we'll see "cart is empty" there.
     candidates = found.get("candidates") or [
         {"x": found.get("x"), "y": found.get("y"),
          "tag": found.get("tag"), "cls": found.get("cls"),
          "aria": found.get("aria"), "w": found.get("w"), "h": found.get("h")}
     ]
-    logger.info(f"  ranked candidates for '{product_name}': {candidates}")
+    tier = found.get("tier", 1)
+    logger.info(
+        f"  ranked candidates (tier {tier}) for '{product_name}': {candidates}"
+    )
 
     add_ok = False
     for idx, cand in enumerate(candidates, 1):
@@ -1602,10 +1621,19 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None):
             logger.debug(f"  click on candidate #{idx} failed: {e}")
             continue
 
-        # Poll the header cart badge for up to ~20s waiting for it to
-        # increment. The server-side add-to-cart can take 5-10s on Styx
-        # (previously this was a single read after ~1.3s, so we gave up
-        # while the request was still in flight).
+        if tier == 1:
+            # Strict cart-class match - trust it. Just wait for the server
+            # so the next step (opening the header cart) sees fresh state.
+            time.sleep(random.uniform(6.0, 8.0))
+            after_badge = _read_cart_badge()
+            logger.info(
+                f"  tier-1 click on candidate #{idx}: trusting the heuristic. "
+                f"badge (may be stale): {after_badge}"
+            )
+            add_ok = True
+            break
+
+        # tier 2: positional fallback - we need to verify. Poll the badge.
         poll_deadline = time.time() + 20.0
         last_after_badge = None
         added = False
@@ -1624,8 +1652,7 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None):
         after_badge = last_after_badge
         after_n = (after_badge or {}).get("count") if after_badge else None
         logger.info(
-            f"  header cart badge AFTER candidate #{idx} (polled "
-            f"{(time.time() - (poll_deadline - 20.0)):.1f}s): {after_badge}"
+            f"  tier-2 badge AFTER candidate #{idx} (polled up to 20s): {after_badge}"
         )
 
         if added:
@@ -1635,14 +1662,10 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None):
                 f"candidate #{idx} tag={cand.get('tag')} "
                 f"cls='{(cand.get('cls') or '')[:60]}'"
             )
-            # Update for any subsequent comparisons (e.g. if user runs the
-            # buy flow again).
             before_n = after_n
             break
 
         # No increment -> wrong icon was likely clicked. Try the next one.
-        # First, dismiss any popup/modal that may have opened (e.g. the
-        # "Write to seller" dialog if we clicked the mail icon).
         try:
             page.keyboard.press("Escape")
             time.sleep(0.3)
@@ -1656,9 +1679,8 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None):
 
     if not add_ok:
         logger.error(
-            f"Tried {len(candidates)} candidate(s) but none incremented "
-            f"the header cart badge. Cannot reliably add '{product_name}' "
-            f"to cart."
+            f"Tried {len(candidates)} candidate(s) but none looked added. "
+            f"Cannot reliably add '{product_name}' to cart."
         )
         if debug_dir:
             page.screenshot(path=os.path.join(debug_dir, "22b_no_add_to_cart.png"),
