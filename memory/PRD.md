@@ -13,23 +13,33 @@ Python automation using Playwright to register accounts on `https://styxmarket.s
 ## Implementation status (Feb 2026)
 
 ### Done
-- **Feb 2026 — Fixed BNB → TRX top-up tile selection bug.** Root cause: prior
-  iteration clicked the crypto tile via JS `target.dispatchEvent(new MouseEvent('click', ...))`.
-  Modern frontends (React/Vue) gate state changes on `event.isTrusted === true`,
-  so the synthetic click was silently ignored and the default tile (TRX) stayed
-  selected — but the script reported "clicked OK" and proceeded, producing a
-  TRX deposit address instead of BNB. Fix in `do_topup()`:
-    1. Primary click is now Playwright's native locator click
-       (`page.locator(".wallet-currency-toggler", has=...).click()`) — trusted.
-    2. Fallback uses `page.mouse.click(x, y)` at the tile's bounding-box center
-       (real CDP `Input.dispatchMouseEvent`, also trusted).
-    3. Removed all `dispatchEvent(new MouseEvent(...))` paths.
-    4. Selection detector rewritten to (a) check direct a11y/data attrs and
-       checked inputs, and (b) diff classNames vs sibling tiles using
-       majority-intersection (so "active" moving between tiles is detected
-       symmetrically) — no longer fooled by frameworks that don't use `active`.
-    5. Up to 2 retries via trusted mouse click before aborting; aborts loudly
-       if the wrong tile is highlighted (prevents wrong-coin deposits).
+- **Feb 2026 — Fixed BNB → TRX top-up tile selection bug (round 2).** First fix
+  replaced JS `dispatchEvent` with Playwright native `.click()` on
+  `.wallet-currency-toggler`, but that element is rendered with `display: contents`
+  on Styx (zero-size wrapper) so Playwright reported "element is not visible"
+  and bailed out. **Round-2 fix**:
+    1. Click target switched to the INNER `.wallet-currency-toggler__title`
+       (the layer Playwright itself reports as "intercepts pointer events" =
+       the real interactive surface).
+    2. 4-layer strategy: (A) Playwright native click on `__title`, (B)
+       `page.mouse.click(x, y)` at the smallest visible ancestor's bbox
+       (still trusted, real CDP `Input.dispatchMouseEvent`), (C) `force=True`
+       click on `.wct-coin-name` directly (bypasses Playwright's overlay
+       check, since the overlay IS what we want to click), (D) role/text
+       fallbacks also with `force=True`.
+    3. `_find_tile_box()` JS rewritten to find the smallest VISIBLE ancestor
+       (skips zero-size wrappers like `display: contents`).
+    4. `_is_selected()` JS rewritten to inspect BOTH the inner __title AND
+       the outer toggler for state classes / aria attrs / checked inputs +
+       robust class-set diff against siblings. Verified against 3 synthetic
+       scenarios in `/app/tests/test_is_selected.js` (passes all).
+    5. Up to 2 retries via trusted mouse click before aborting with a
+       `12b_topup_wrong_tile.png` screenshot.
+- **Feb 2026 — Added `--threads N` for parallel registrations.** N
+  independent worker threads each spawn their own `sync_playwright()` context
+  with an isolated profile dir (`<profile>.t<i>`) so Chromium's profile lock
+  doesn't collide. CSV writes serialized via `_PERSIST_LOCK`. Total accounts =
+  `--threads * --count * len(urls)`. Default `--threads 1` = unchanged behavior.
 - Removed silent `patchright → playwright` fallback (root cause of last user failure). Script now exits with a clear install message if patchright missing.
 - Cross-platform profile dir via `tempfile.gettempdir()` (works on Windows/macOS/Linux).
 - Added `--proxy` CLI flag + `STYX_PROXY` env var. Plumbed through both engines.

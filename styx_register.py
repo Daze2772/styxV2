@@ -25,7 +25,9 @@ import os
 import sys
 import math
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import cv2
 import numpy as np
 from loguru import logger
@@ -456,6 +458,14 @@ def do_topup(page, amount, currency_label="BNB (BEP20)",
     # with exact text, walk up to the .wallet-currency-toggler ancestor) but
     # this time we ONLY use JS to compute the bounding box. The actual click
     # is done from Python via page.mouse, which is a trusted event.
+    #
+    # IMPORTANT (lesson from the 2026-06-18 user log):
+    #   The outer `.wallet-currency-toggler` is sometimes a zero-size wrapper
+    #   (e.g. `display: contents`). Its child `.wallet-currency-toggler__title
+    #    wct-with-icon` is the actual visible/clickable layer (and the one
+    #   Playwright reports as "intercepts pointer events"). We MUST therefore
+    #   pick the smallest VISIBLE ancestor of the name span, not just the
+    #   first toggler ancestor.
     def _find_tile_box():
         try:
             return page.evaluate(
@@ -479,12 +489,35 @@ def do_topup(page, amount, currency_label="BNB (BEP20)",
                     }
                     if (!matched) return { ok: false, reason: 'no text match' };
 
-                    // Walk up to the nearest tile-like ancestor.
-                    const isStyxTile = (el) => {
-                        if (!el || !el.className || !el.className.toString) return false;
-                        return /wallet-currency-toggler(?!__)/i.test(el.className.toString());
+                    const sizeOf = (el) => {
+                        try {
+                            const r = el.getBoundingClientRect();
+                            return { w: r.width, h: r.height, x: r.left, y: r.top };
+                        } catch (e) { return { w: 0, h: 0, x: 0, y: 0 }; }
                     };
-                    const isClickable = (el) => {
+                    const isVisible = (el) => {
+                        if (!el) return false;
+                        const sz = sizeOf(el);
+                        if (sz.w < 2 || sz.h < 2) return false;
+                        try {
+                            const cs = getComputedStyle(el);
+                            if (cs.visibility === 'hidden' || cs.display === 'none'
+                                || parseFloat(cs.opacity) === 0) return false;
+                        } catch (e) {}
+                        return true;
+                    };
+
+                    // Walk up: prefer the inner clickable surface
+                    // .wallet-currency-toggler__title (the one that actually
+                    // intercepts pointer events on this site). Then any
+                    // visible interactive ancestor.
+                    const isStyxTitle = (el) =>
+                        el && el.className && el.className.toString
+                        && /wallet-currency-toggler__title/.test(el.className.toString());
+                    const isStyxOuter = (el) =>
+                        el && el.className && el.className.toString
+                        && /wallet-currency-toggler(?!__)/.test(el.className.toString());
+                    const isInteractive = (el) => {
                         if (!el || !el.tagName) return false;
                         const t = el.tagName.toLowerCase();
                         if (t === 'button' || t === 'a' || t === 'label') return true;
@@ -497,19 +530,40 @@ def do_topup(page, amount, currency_label="BNB (BEP20)",
 
                     let target = null;
                     let cur = matched;
+
+                    // Pass 1: nearest visible __title (preferred, that's the
+                    // element which intercepts pointer events).
                     for (let i = 0; i < 10 && cur; i++) {
-                        if (isStyxTile(cur)) { target = cur; break; }
+                        if (isStyxTitle(cur) && isVisible(cur)) { target = cur; break; }
                         cur = cur.parentElement;
                     }
+                    // Pass 2: nearest visible outer toggler.
                     if (!target) {
                         cur = matched;
                         for (let i = 0; i < 10 && cur; i++) {
-                            if (isClickable(cur)) { target = cur; break; }
+                            if (isStyxOuter(cur) && isVisible(cur)) { target = cur; break; }
+                            cur = cur.parentElement;
+                        }
+                    }
+                    // Pass 3: nearest visible interactive ancestor.
+                    if (!target) {
+                        cur = matched;
+                        for (let i = 0; i < 10 && cur; i++) {
+                            if (isInteractive(cur) && isVisible(cur)) { target = cur; break; }
+                            cur = cur.parentElement;
+                        }
+                    }
+                    // Pass 4: smallest visible ancestor (last-resort - just
+                    // anything we can click that has a real bounding box).
+                    if (!target) {
+                        cur = matched;
+                        for (let i = 0; i < 12 && cur; i++) {
+                            if (isVisible(cur)) { target = cur; break; }
                             cur = cur.parentElement;
                         }
                     }
                     if (!target) {
-                        return { ok: false, reason: 'no clickable ancestor',
+                        return { ok: false, reason: 'no visible ancestor',
                                  text: norm(matched.textContent) };
                     }
 
@@ -550,98 +604,128 @@ def do_topup(page, amount, currency_label="BNB (BEP20)",
                     const want = norm(label);
                     const nameEls = Array.from(document.querySelectorAll('.wct-coin-name'));
 
-                    // Helper: find the .wallet-currency-toggler ancestor.
-                    const tileOf = (el) => {
+                    // Helper: walk up and collect BOTH the inner __title and
+                    // the outer .wallet-currency-toggler ancestor. Either (or
+                    // both) may carry the "selected" state class - on Styx the
+                    // outer is often display:contents so the visible state is
+                    // on the inner __title.
+                    const ancestorsOf = (el) => {
+                        let inner = null, outer = null;
                         let cur = el;
-                        for (let i = 0; i < 10 && cur; i++) {
+                        for (let i = 0; i < 12 && cur; i++) {
                             const cls = (cur.className && cur.className.toString)
                                            ? cur.className.toString() : '';
-                            if (/wallet-currency-toggler(?!__)/i.test(cls)) return cur;
+                            if (!inner && /wallet-currency-toggler__title/.test(cls)) inner = cur;
+                            if (!outer && /wallet-currency-toggler(?!__)/.test(cls)) outer = cur;
+                            if (inner && outer) break;
                             cur = cur.parentElement;
                         }
-                        return null;
+                        return { inner, outer };
+                    };
+                    const stateClassRx = /\\bactive\\b|\\bselected\\b|\\bchecked\\b|\\bchosen\\b|\\bcurrent\\b|--is-active|--is-selected|is-active|is-selected/i;
+                    const isStateOn = (el) => {
+                        if (!el) return false;
+                        const cls = (el.className && el.className.toString)
+                                       ? el.className.toString() : '';
+                        if (stateClassRx.test(cls)) return true;
+                        if (el.getAttribute && (
+                               el.getAttribute('aria-selected') === 'true'
+                            || el.getAttribute('aria-pressed') === 'true'
+                            || el.getAttribute('aria-checked') === 'true'
+                            || el.getAttribute('data-active') === 'true'
+                            || el.getAttribute('data-selected') === 'true')) return true;
+                        return false;
                     };
 
                     const targetName = nameEls.find(el => norm(el.textContent) === want);
-                    if (!targetName) return { ok: false, reason: 'tile not in DOM' };
-                    const target = tileOf(targetName);
-                    if (!target) return { ok: false, reason: 'no toggler ancestor' };
+                    if (!targetName) {
+                        const tiles = nameEls.map(n => norm(n.textContent));
+                        return { ok: false, reason: 'tile not in DOM', tilesFound: tiles };
+                    }
+                    const { inner: tInner, outer: tOuter } = ancestorsOf(targetName);
+                    if (!tInner && !tOuter) return { ok: false, reason: 'no toggler ancestor' };
 
-                    // All sibling tiles (other coins on the same page).
-                    const allTiles = Array.from(document.querySelectorAll('.wallet-currency-toggler'))
+                    // All sibling tiles. Use outer if present, else __title.
+                    let allOuter = Array.from(document.querySelectorAll('.wallet-currency-toggler'))
                         .filter(el => !/__/.test(el.className.toString()));
-
-                    const labels = allTiles.map(t => {
-                        const n = t.querySelector('.wct-coin-name');
+                    let allInner = Array.from(document.querySelectorAll('.wallet-currency-toggler__title'));
+                    const tilesFound = (allOuter.length ? allOuter : allInner).map(t => {
+                        const n = t.querySelector('.wct-coin-name')
+                              || (t.parentElement && t.parentElement.querySelector('.wct-coin-name'));
                         return n ? norm(n.textContent) : '';
                     });
-                    const targetCls = target.className.toString();
-                    const targetClsSet = new Set(targetCls.split(/\\s+/).filter(Boolean));
 
-                    // (1) Direct signals on the tile itself.
-                    const directSelected =
-                           /active|selected|checked|chosen|current|--is-|is-active|is-selected/i.test(targetCls)
-                        || target.getAttribute('aria-selected') === 'true'
-                        || target.getAttribute('aria-pressed') === 'true'
-                        || target.getAttribute('data-active') === 'true'
-                        || target.getAttribute('data-selected') === 'true';
+                    // (1) Direct signals on inner OR outer.
+                    const directSelected = isStateOn(tInner) || isStateOn(tOuter);
 
-                    // (2) Hidden input / radio inside the tile.
+                    // (2) Hidden input / radio inside either ancestor.
                     let inputChecked = false;
-                    const inputs = target.querySelectorAll('input');
-                    inputs.forEach(inp => { if (inp.checked) inputChecked = true; });
+                    const checkInputs = (el) => {
+                        if (!el) return;
+                        el.querySelectorAll('input').forEach(inp => {
+                            if (inp.checked) inputChecked = true;
+                        });
+                    };
+                    checkInputs(tInner);
+                    checkInputs(tOuter);
 
-                    // (3) Class-diff vs siblings.
-                    // The "selected" tile is the one whose class set is the
-                    // MINORITY: every other tile shares some class it doesn't
-                    // have (or vice-versa). We compute, for each sibling, the
-                    // set of classes that distinguish it from the target. The
-                    // tile with the most siblings that look identical to each
-                    // other but different from itself is the selected one.
-                    //
-                    // Concrete check: the target is "selected by diff" iff
-                    // there exists at least one class C such that the target
-                    // has C and NO sibling has C  (target is uniquely "on"),
-                    // OR every sibling has a class C that the target lacks
-                    // AND all siblings agree on that class (siblings share an
-                    // "inactive" marker the target alone is missing).
-                    const siblingClsSets = allTiles
-                        .filter(t => t !== target)
-                        .map(t => new Set(t.className.toString().split(/\\s+/).filter(Boolean)));
-
-                    // Classes target has that NO sibling has.
-                    const uniqueToTarget = [];
-                    for (const c of targetClsSet) {
-                        if (siblingClsSets.every(s => !s.has(c))) {
-                            uniqueToTarget.push(c);
-                        }
+                    // (3) Class-diff vs siblings - run on whichever ancestor
+                    // level we're using to identify tiles (prefer outer, fall
+                    // back to inner).
+                    const tilesForDiff = (allOuter.length ? allOuter : allInner);
+                    let diffTarget;
+                    if (allOuter.length) {
+                        diffTarget = tOuter || tInner;
+                    } else {
+                        diffTarget = tInner || tOuter;
                     }
-                    // Classes EVERY sibling has but the target lacks.
-                    const uniqueToOthers = [];
-                    if (siblingClsSets.length > 0) {
-                        const intersect = new Set(siblingClsSets[0]);
-                        for (let i = 1; i < siblingClsSets.length; i++) {
-                            for (const c of Array.from(intersect)) {
-                                if (!siblingClsSets[i].has(c)) intersect.delete(c);
+                    let diffSelected = false;
+                    let uniqueToTarget = [];
+                    let uniqueToOthers = [];
+                    if (diffTarget && tilesForDiff.length > 1) {
+                        const tClsSet = new Set(diffTarget.className.toString().split(/\\s+/).filter(Boolean));
+                        const sibSets = tilesForDiff
+                            .filter(t => t !== diffTarget)
+                            .map(t => new Set(t.className.toString().split(/\\s+/).filter(Boolean)));
+                        for (const c of tClsSet) {
+                            if (sibSets.every(s => !s.has(c))) uniqueToTarget.push(c);
+                        }
+                        if (sibSets.length > 0) {
+                            const inter = new Set(sibSets[0]);
+                            for (let i = 1; i < sibSets.length; i++) {
+                                for (const c of Array.from(inter)) {
+                                    if (!sibSets[i].has(c)) inter.delete(c);
+                                }
+                            }
+                            for (const c of inter) {
+                                if (!tClsSet.has(c)) uniqueToOthers.push(c);
                             }
                         }
-                        for (const c of intersect) {
-                            if (!targetClsSet.has(c)) uniqueToOthers.push(c);
-                        }
+                        diffSelected = uniqueToTarget.length > 0 || uniqueToOthers.length > 0;
                     }
-                    const diffSelected = uniqueToTarget.length > 0 || uniqueToOthers.length > 0;
 
                     // Which tile does the page currently appear to highlight?
                     let highlighted = null;
-                    for (const t of allTiles) {
-                        const cls = t.className.toString();
-                        if (/active|selected|checked|chosen|current|--is-|is-active|is-selected/i.test(cls)
-                            || t.getAttribute('aria-selected') === 'true'
-                            || t.getAttribute('aria-pressed') === 'true'
-                            || t.getAttribute('data-active') === 'true'
-                            || t.getAttribute('data-selected') === 'true'
-                            || Array.from(t.querySelectorAll('input')).some(i => i.checked)) {
-                            const n = t.querySelector('.wct-coin-name');
+                    const tilesForHL = allOuter.length ? allOuter : allInner;
+                    for (const t of tilesForHL) {
+                        let on = isStateOn(t);
+                        if (!on) {
+                            // Also check the matching inner/outer counterpart.
+                            if (allOuter.length) {
+                                const innerOf = t.querySelector('.wallet-currency-toggler__title');
+                                if (isStateOn(innerOf)) on = true;
+                            } else {
+                                const outerOf = t.closest('.wallet-currency-toggler');
+                                if (isStateOn(outerOf)) on = true;
+                            }
+                        }
+                        if (!on) {
+                            const ins = t.querySelectorAll('input');
+                            for (const i of ins) if (i.checked) { on = true; break; }
+                        }
+                        if (on) {
+                            const n = t.querySelector('.wct-coin-name')
+                                  || (t.parentElement && t.parentElement.querySelector('.wct-coin-name'));
                             highlighted = n ? norm(n.textContent) : '';
                             break;
                         }
@@ -656,8 +740,9 @@ def do_topup(page, amount, currency_label="BNB (BEP20)",
                         uniqueToTarget: uniqueToTarget,
                         uniqueToOthers: uniqueToOthers,
                         highlighted: highlighted,
-                        targetCls: targetCls,
-                        tilesFound: labels,
+                        innerCls: tInner ? tInner.className.toString() : null,
+                        outerCls: tOuter ? tOuter.className.toString() : null,
+                        tilesFound: tilesFound,
                     };
                 }""",
                 currency_label,
@@ -666,18 +751,25 @@ def do_topup(page, amount, currency_label="BNB (BEP20)",
             logger.debug(f"selection check failed: {e}")
             return None
 
-    # ----- Strategy A: NATIVE Playwright locator click (trusted) -----
+    # ----- Strategy A: NATIVE Playwright locator click on the INNER __title -----
+    # On Styx the outer .wallet-currency-toggler is often display:contents (zero
+    # bounding box, Playwright reports "element is not visible"). The actual
+    # clickable layer that intercepts pointer events is the inner
+    # .wallet-currency-toggler__title. We target THAT directly.
+    inner_loc = page.locator(
+        ".wallet-currency-toggler__title",
+        has=page.locator(".wct-coin-name", has_text=currency_label),
+    ).first
     try:
-        tile_loc = page.locator(
-            ".wallet-currency-toggler",
-            has=page.locator(".wct-coin-name", has_text=currency_label),
-        ).first
-        tile_loc.scroll_into_view_if_needed(timeout=4000)
-        tile_loc.click(timeout=5000)
+        try:
+            inner_loc.scroll_into_view_if_needed(timeout=4000)
+        except Exception as e:
+            logger.debug(f"  scroll_into_view on inner __title failed (non-fatal): {e}")
+        inner_loc.click(timeout=5000)
         clicked = True
-        logger.info(f"  -> clicked '{currency_label}' via Playwright locator (trusted)")
+        logger.info(f"  -> clicked '{currency_label}' via inner __title locator (trusted)")
     except Exception as e:
-        logger.debug(f"  native locator click failed: {e}")
+        logger.debug(f"  inner __title locator click failed: {e}")
 
     # ----- Strategy B: page.mouse.click at the tile's bounding box (trusted) -----
     if not clicked:
@@ -694,25 +786,40 @@ def do_topup(page, amount, currency_label="BNB (BEP20)",
                 clicked = True
                 logger.info(
                     f"  -> mouse-clicked '{currency_label}' at ({jx:.1f},{jy:.1f}) "
-                    f"size={box['w']:.0f}x{box['h']:.0f} (trusted)"
+                    f"size={box['w']:.0f}x{box['h']:.0f} cls='{box.get('cls','')[:60]}' (trusted)"
                 )
             except Exception as e:
                 logger.debug(f"  mouse.click at box failed: {e}")
         else:
             logger.debug(f"  could not resolve tile box: {box}")
 
-    # ----- Strategy C: legacy text/role fallbacks (still native, still trusted) -----
+    # ----- Strategy C: force-click on the name span itself -----
+    # Clicking the .wct-coin-name with force=True bypasses Playwright's
+    # "element intercepts pointer events" check. Since the interceptor (the
+    # __title div) is precisely the layer with the click handler, clicking
+    # at the name-span's position effectively clicks the title.
+    if not clicked:
+        try:
+            page.locator(".wct-coin-name", has_text=currency_label).first.click(
+                timeout=4000, force=True
+            )
+            clicked = True
+            logger.info(f"  -> force-clicked .wct-coin-name '{currency_label}' (trusted)")
+        except Exception as e:
+            logger.debug(f"  force-click on .wct-coin-name failed: {e}")
+
+    # ----- Strategy D: legacy text/role fallbacks with force=True -----
     if not clicked:
         strategies = [
             ("role=button exact",
              lambda: page.get_by_role("button", name=currency_label, exact=True)
-                          .first.click(timeout=4000)),
-            ("text exact",
+                          .first.click(timeout=4000, force=True)),
+            ("text exact (force)",
              lambda: page.get_by_text(currency_label, exact=True).first
-                          .click(timeout=4000)),
-            ("text contains",
+                          .click(timeout=4000, force=True)),
+            ("text contains (force)",
              lambda: page.get_by_text(currency_label, exact=False).first
-                          .click(timeout=4000)),
+                          .click(timeout=4000, force=True)),
         ]
         for name, strat in strategies:
             try:
@@ -743,25 +850,33 @@ def do_topup(page, amount, currency_label="BNB (BEP20)",
         # Use the bounding-box mouse click on retry too - it's the most
         # reliable trusted-event path we have.
         box = _find_tile_box()
-        if not (box and box.get("ok")):
-            return False
-        try:
-            x = float(box["x"]) + random.uniform(-2.0, 2.0)
-            y = float(box["y"]) + random.uniform(-2.0, 2.0)
-            page.mouse.move(x, y, steps=random.randint(8, 14))
-            time.sleep(random.uniform(0.05, 0.15))
-            page.mouse.click(x, y, delay=random.randint(40, 90))
-            return True
-        except Exception as e:
-            logger.debug(f"  retry mouse.click failed: {e}")
+        if box and box.get("ok"):
+            try:
+                x = float(box["x"]) + random.uniform(-2.0, 2.0)
+                y = float(box["y"]) + random.uniform(-2.0, 2.0)
+                page.mouse.move(x, y, steps=random.randint(8, 14))
+                time.sleep(random.uniform(0.05, 0.15))
+                page.mouse.click(x, y, delay=random.randint(40, 90))
+                return True
+            except Exception as e:
+                logger.debug(f"  retry mouse.click failed: {e}")
+        # Fallback: inner __title click (force-click bypasses overlay checks).
         try:
             page.locator(
-                ".wallet-currency-toggler",
+                ".wallet-currency-toggler__title",
                 has=page.locator(".wct-coin-name", has_text=currency_label),
-            ).first.click(timeout=4000)
+            ).first.click(timeout=4000, force=True)
             return True
         except Exception as e:
-            logger.debug(f"  retry locator click failed: {e}")
+            logger.debug(f"  retry __title click failed: {e}")
+        # Last resort: force-click the name span.
+        try:
+            page.locator(".wct-coin-name", has_text=currency_label).first.click(
+                timeout=4000, force=True
+            )
+            return True
+        except Exception as e:
+            logger.debug(f"  retry name-span force-click failed: {e}")
             return False
 
     retries = 0
@@ -1188,17 +1303,21 @@ def process_registration(page, url, max_captcha_retries=3, debug_dir=None,
             logger.info("Session is now YOURS. Close the browser window when done.")
             logger.info("(The script will exit automatically when you close the tab.)")
             logger.info("=" * 64)
+            # Persist the result IMMEDIATELY (before waiting on close), so we
+            # never lose creds if the user kills the script or the browser
+            # crashes. Thread-safe via _PERSIST_LOCK.
+            try:
+                _persist_results([result], "accounts.csv")
+            except Exception as e:
+                logger.debug(f"persist on keep_open failed: {e}")
             try:
                 page.wait_for_event("close", timeout=0)
             except Exception as e:
                 logger.debug(f"wait_for_event('close') ended: {e}")
             logger.info("Browser tab closed by user - exiting.")
-            # Persist the result BEFORE we exit, so users don't lose creds.
-            try:
-                _persist_results([result], "accounts.csv")
-            except Exception as e:
-                logger.debug(f"persist on exit failed: {e}")
-            sys.exit(0)
+            # Return None so the caller doesn't double-persist this result via
+            # the final _persist_results(results, args.output) in main().
+            return None
 
         return result
     logger.error("Registration flow failed at CAPTCHA stage.")
@@ -1265,15 +1384,17 @@ def _warn_if_datacenter_ip():
         logger.debug(f"IP-trust pre-flight check failed (non-fatal): {e}")
 
 
-def _run_with_patchright(args, urls, debug_dir, results):
-    """Patchright (Chrome + stealth patches) launcher."""
+def _run_with_patchright(args, urls, debug_dir, results, results_lock, profile_dir):
+    """Patchright (Chrome + stealth patches) launcher. One worker = one
+    persistent context = one Chrome profile. Each parallel worker MUST pass a
+    distinct `profile_dir` so Chromium's profile lock doesn't collide."""
     # CRITICAL: with channel="chrome" we MUST NOT override user_agent / viewport /
     # timezone_id / locale, because real Chrome already has perfectly consistent
     # values for all of those. Overriding even one creates a mismatch between
     # the JS-reported value and the build/OS/binary, which Cloudflare's worker
     # cross-checks. Let Chrome be itself.
     launch_kwargs = dict(
-        user_data_dir=args.profile,
+        user_data_dir=profile_dir,
         headless=args.headless,
         no_viewport=True,
         viewport=None,
@@ -1315,7 +1436,8 @@ def _run_with_patchright(args, urls, debug_dir, results):
                         keep_session=args.keep_session,
                     )
                     if result:
-                        results.append(result)
+                        with results_lock:
+                            results.append(result)
                 except Exception as e:
                     logger.error(f"Critical error on {url}: {e}")
                 finally:
@@ -1328,17 +1450,15 @@ def _run_with_patchright(args, urls, debug_dir, results):
                 if args.count > 1 and i < args.count - 1:
                     time.sleep(random.uniform(4.0, 8.0))
 
-        if not args.keep_open:
+        try:
             context.close()
-        else:
-            try:
-                context.close()
-            except Exception:
-                pass
+        except Exception:
+            pass
 
 
-def _run_with_camoufox(args, urls, debug_dir, results):
-    """Camoufox (Firefox + C++ fingerprint injection) launcher."""
+def _run_with_camoufox(args, urls, debug_dir, results, results_lock, profile_dir):
+    """Camoufox (Firefox + C++ fingerprint injection) launcher. Per-worker
+    profile dir for parallel-safe operation."""
     if not HAS_CAMOUFOX:
         logger.error("--engine=camoufox requested but 'camoufox' is not installed.")
         logger.error("Install with:  pip install camoufox[geoip]  &&  camoufox fetch")
@@ -1350,7 +1470,7 @@ def _run_with_camoufox(args, urls, debug_dir, results):
         humanize=True,           # human-like cursor movement
         os=("windows", "macos"), # rotate among realistic OS fingerprints
         persistent_context=True,
-        user_data_dir=args.profile,
+        user_data_dir=profile_dir,
     )
     if proxy:
         cf_kwargs["proxy"] = proxy
@@ -1373,7 +1493,8 @@ def _run_with_camoufox(args, urls, debug_dir, results):
                         keep_session=args.keep_session,
                     )
                     if result:
-                        results.append(result)
+                        with results_lock:
+                            results.append(result)
                 except Exception as e:
                     logger.error(f"Critical error on {url}: {e}")
                 finally:
@@ -1384,6 +1505,65 @@ def _run_with_camoufox(args, urls, debug_dir, results):
                             pass
                 if args.count > 1 and i < args.count - 1:
                     time.sleep(random.uniform(4.0, 8.0))
+
+
+def _worker_entry(args, urls, debug_dir, results, results_lock, worker_idx, profile_dir):
+    """Run one worker (one browser/context) in its own thread. Each worker has
+    its own profile dir to avoid Chromium/Firefox profile-lock collisions."""
+    try:
+        if args.engine == "camoufox":
+            _run_with_camoufox(args, urls, debug_dir, results, results_lock, profile_dir)
+        else:
+            _run_with_patchright(args, urls, debug_dir, results, results_lock, profile_dir)
+    except Exception as e:
+        logger.error(f"[worker {worker_idx}] crashed: {e}")
+    finally:
+        logger.info(f"[worker {worker_idx}] done.")
+
+
+def _run_parallel(args, urls, debug_dir, results, results_lock):
+    """Spawn args.threads worker threads, each running an independent browser
+    context with its own profile dir.
+
+    Note: each worker still processes urls × args.count internally - so the
+    total accounts registered = args.threads * len(urls) * args.count.
+    With defaults (--count 1, one URL) this means --threads 3 -> 3 accounts
+    registered in parallel across 3 independent Chrome windows.
+    """
+    n = max(1, int(args.threads))
+    if n == 1:
+        # Fast path: same behavior as before (no thread pool overhead).
+        _worker_entry(args, urls, debug_dir, results, results_lock,
+                      worker_idx=0, profile_dir=args.profile)
+        return
+
+    logger.info(f"Starting {n} parallel workers (each = 1 browser).")
+    if args.use_real_chrome_profile:
+        logger.warning(
+            "--use-real-chrome-profile is incompatible with --threads > 1 "
+            "(profile lock collision). Workers will use isolated profile dirs."
+        )
+
+    base_profile = args.profile
+    with ThreadPoolExecutor(max_workers=n, thread_name_prefix="styx") as pool:
+        futures = []
+        for i in range(n):
+            # Each worker gets its OWN profile dir so Chromium's
+            # SingletonLock doesn't fight between workers.
+            wprof = f"{base_profile}.t{i}"
+            # Stagger worker starts so the IP-trust pre-flight and browser
+            # launches don't all happen at the exact same millisecond.
+            if i > 0:
+                time.sleep(random.uniform(1.5, 3.5))
+            futures.append(pool.submit(
+                _worker_entry, args, urls, debug_dir, results,
+                results_lock, i, wprof
+            ))
+        for fut in as_completed(futures):
+            try:
+                fut.result()
+            except Exception as e:
+                logger.error(f"worker future error: {e}")
 
 
 # ---------- main ---------------------------------------------------------------
@@ -1444,6 +1624,13 @@ def main():
                              "still reused to keep Cloudflare trust). Use this "
                              "flag if you instead want to resume the previous "
                              "logged-in session.")
+    parser.add_argument("--threads",  type=int, default=1,
+                        help="Number of parallel workers (=parallel browser "
+                             "windows). Each worker uses its OWN isolated "
+                             "profile dir ('<profile>.t<i>') so Chromium's "
+                             "profile lock won't collide. Total accounts "
+                             "registered = --threads * --count * (URLs). "
+                             "Default 1 (sequential).")
     args = parser.parse_args()
 
     # Auto-detect real Chrome profile path if requested
@@ -1501,28 +1688,38 @@ def main():
         shutil.rmtree(args.profile, ignore_errors=True)
 
     results = []
-    if args.engine == "camoufox":
-        _run_with_camoufox(args, urls, debug_dir, results)
-    else:
-        _run_with_patchright(args, urls, debug_dir, results)
+    results_lock = threading.Lock()
+    _run_parallel(args, urls, debug_dir, results, results_lock)
 
     if results:
         _persist_results(results, args.output)
     else:
-        logger.warning("No accounts saved.")
+        # If nothing reached the final list it usually means keep_open mode
+        # persisted in-flow (or all workers failed). Not an error.
+        logger.info("No new accounts to save at exit "
+                    "(keep-open mode persists in-flow).")
+
+
+# Module-level lock for thread-safe CSV writes (shared across workers).
+_PERSIST_LOCK = threading.Lock()
 
 
 def _persist_results(results, output_path):
-    """Append accounts to the CSV (creates with header if needed)."""
+    """Append accounts to the CSV (creates with header if needed).
+
+    Thread-safe via `_PERSIST_LOCK` so parallel workers don't interleave rows
+    or race on header creation.
+    """
     if not results:
         return
-    new_file = not os.path.isfile(output_path)
-    with open(output_path, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["url", "username", "password", "secret"])
-        if new_file:
-            w.writeheader()
-        w.writerows(results)
-    logger.info(f"Saved {len(results)} account(s) -> {output_path}")
+    with _PERSIST_LOCK:
+        new_file = not os.path.isfile(output_path)
+        with open(output_path, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["url", "username", "password", "secret"])
+            if new_file:
+                w.writeheader()
+            w.writerows(results)
+        logger.info(f"Saved {len(results)} account(s) -> {output_path}")
 
 
 if __name__ == "__main__":
