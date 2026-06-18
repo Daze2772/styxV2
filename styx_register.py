@@ -931,24 +931,154 @@ def do_topup(page, amount, currency_label="BNB (BEP20)",
                         full_page=True)
 
     # 3) Click TOP UP BALANCE
+    #
+    # IMPORTANT: this section used to false-fail in a specific way - the click
+    # would go through, the Vue app would route away from the top-up form
+    # MID-CLICK, and Playwright would then report "Timeout: element is not
+    # visible/stable" even though the click was already registered on the
+    # server. Worse, the previous final fallback was `button[type='submit'].last`
+    # which on Styx picks up a HIDDEN <button class="refund-modal__button">
+    # (the refund-policy modal that lives in the DOM but never renders), so
+    # strategy 6 would always "fail" and the whole function returned False.
+    #
+    # Fix: every strategy is wrapped in a "did the page already move past the
+    # form?" check (we look at URL change or appearance of the deposit
+    # address / QR / 'protected by Styx' block). If yes -> treat as success
+    # regardless of what Playwright reported. We also pre-check BEFORE
+    # clicking in case the form already submitted.
     logger.info("Clicking TOP UP BALANCE...")
+
+    def _post_submit_state():
+        """Return a dict describing whether the page has navigated to the
+        post-submit deposit-address state. Used to detect successful click
+        even when Playwright timed out mid-navigation."""
+        try:
+            return page.evaluate(
+                """() => {
+                    const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+                    const text = norm(document.body ? document.body.innerText : '');
+
+                    // (1) The post-submit page shows a wallet address (long
+                    //     alphanumeric string), a QR canvas/img, and copy
+                    //     buttons. The pre-submit form does not.
+                    const hasQR = !!document.querySelector(
+                        'canvas, img[src*="qr"], img[alt*="QR" i], svg[class*="qr" i], [class*="qrcode"], [class*="qr-code"]');
+                    const addrRx = /\\b[a-zA-Z0-9]{25,}\\b/;
+                    const hasAddress = addrRx.test(text);
+                    const hasProtectedBanner = /all orders are protected|deposit address|send (the )?(exact|payment|amount)/i.test(text);
+                    const hasSuccessCheck = /(deposit (was )?(received|confirmed|successful)|payment (was )?(received|confirmed|successful)|thank you|completed)/i.test(text);
+
+                    // (2) The top-up form is GONE (no amount input, no
+                    //     wallet-currency-toggler tiles, no TOP UP BALANCE
+                    //     button text).
+                    const stillHasAmount = !!document.querySelector(
+                        "input[name='amount'], input[name='payment_amount']");
+                    const stillHasTiles = !!document.querySelector('.wallet-currency-toggler');
+                    const stillHasTopupBtn = /\\bTOP UP BALANCE\\b/i.test(text);
+                    const formGone = !stillHasAmount && !stillHasTopupBtn && !stillHasTiles;
+
+                    return {
+                        hasQR, hasAddress, hasProtectedBanner, hasSuccessCheck,
+                        stillHasAmount, stillHasTiles, stillHasTopupBtn, formGone,
+                        urlPath: location.pathname + location.search,
+                    };
+                }"""
+            )
+        except Exception as e:
+            logger.debug(f"  post-submit state probe failed: {e}")
+            return None
+
+    def _looks_submitted(state):
+        if not state:
+            return False
+        # Strong signal: deposit-address / QR / "protected by Styx" present.
+        if state.get("hasAddress") or state.get("hasQR") or state.get("hasProtectedBanner"):
+            return True
+        # Strong signal: already showing the confirmation/success state.
+        if state.get("hasSuccessCheck"):
+            return True
+        # Fallback: the entire top-up form is gone.
+        if state.get("formGone"):
+            return True
+        return False
+
+    pre_state = _post_submit_state()
+    if _looks_submitted(pre_state):
+        logger.info(f"  page is already past the top-up form ({pre_state}); skipping click.")
+        if debug_dir:
+            page.screenshot(path=os.path.join(debug_dir, "16_topup_submitted.png"),
+                            full_page=True)
+        logger.success(f"Top-up submitted: {currency_label} amount={amount}")
+        return True
+    start_url = (pre_state or {}).get("urlPath")
+
+    # Strategies, in order. We deliberately do NOT use
+    # `button[type='submit'].last` because Styx has a hidden refund-modal
+    # submit button that gets picked first and causes a false "could not
+    # click" failure. We constrain to visible buttons only.
     btn_strategies = [
-        lambda: page.get_by_role("button", name="TOP UP BALANCE").first.click(timeout=5000),
-        lambda: page.get_by_role("button", name="Top up balance").first.click(timeout=5000),
-        lambda: page.locator("button:has-text('TOP UP BALANCE')").first.click(timeout=5000),
-        lambda: page.locator("button:has-text('Top up balance')").first.click(timeout=5000),
-        lambda: page.locator("button:has-text('Top up')").last.click(timeout=5000),
-        lambda: page.locator("button[type='submit']").last.click(timeout=5000),
+        ("role=TOP UP BALANCE",
+         lambda: page.get_by_role("button", name="TOP UP BALANCE").first.click(timeout=5000)),
+        ("role=Top up balance",
+         lambda: page.get_by_role("button", name="Top up balance").first.click(timeout=5000)),
+        ("text=TOP UP BALANCE",
+         lambda: page.locator("button:has-text('TOP UP BALANCE'):visible").first.click(timeout=5000)),
+        ("text=Top up balance",
+         lambda: page.locator("button:has-text('Top up balance'):visible").first.click(timeout=5000)),
+        ("text=Top up (visible)",
+         lambda: page.locator("button:has-text('Top up'):visible").last.click(timeout=5000)),
+        # Force-click variants - if Playwright thinks the element isn't
+        # actionable but we know it's the one we want, force the click.
+        ("text=TOP UP BALANCE (force)",
+         lambda: page.locator("button:has-text('TOP UP BALANCE')").first.click(timeout=5000, force=True)),
+        ("text=Top up (force)",
+         lambda: page.locator("button:has-text('Top up')").last.click(timeout=5000, force=True)),
     ]
+
     btn_clicked = False
-    for i, strat in enumerate(btn_strategies, 1):
+    for i, (name, strat) in enumerate(btn_strategies, 1):
         try:
             strat()
             btn_clicked = True
-            logger.info(f"  -> clicked TOP UP BALANCE (strategy {i})")
+            logger.info(f"  -> clicked TOP UP BALANCE (strategy {i}: {name})")
             break
         except Exception as e:
-            logger.debug(f"  topup-button strategy {i} failed: {e}")
+            # The click MAY have actually gone through but Playwright bailed
+            # out of its actionability wait because the page is navigating.
+            # Check the page state - if it has moved past the form, treat
+            # this as a successful click.
+            err_msg = str(e).splitlines()[0] if str(e) else 'unknown'
+            time.sleep(0.5)  # small grace for the navigation to settle
+            post_state = _post_submit_state()
+            if _looks_submitted(post_state):
+                logger.info(
+                    f"  -> strategy {i} ({name}) reported '{err_msg[:80]}' but the "
+                    f"page has moved on ({post_state}). Treating as successful click."
+                )
+                btn_clicked = True
+                break
+            # URL changed even though no deposit signals yet? Probably still
+            # success (e.g. POST -> GET redirect in flight).
+            if (start_url and post_state
+                and post_state.get("urlPath") and post_state.get("urlPath") != start_url):
+                logger.info(
+                    f"  -> strategy {i} ({name}) reported timeout but URL "
+                    f"changed ('{start_url}' -> '{post_state.get('urlPath')}'). "
+                    f"Treating as successful click."
+                )
+                btn_clicked = True
+                break
+            logger.debug(f"  topup-button strategy {i} ({name}) failed: {err_msg[:200]}")
+    if not btn_clicked:
+        # Final safety net: maybe the click DID go through earlier in this
+        # loop but every strategy raised before we noticed. Re-probe.
+        final_state = _post_submit_state()
+        if _looks_submitted(final_state):
+            logger.warning(
+                "  All button strategies raised, but the page has moved past "
+                f"the top-up form anyway ({final_state}). Treating as success."
+            )
+            btn_clicked = True
     if not btn_clicked:
         logger.error("Could not click TOP UP BALANCE.")
         if debug_dir:

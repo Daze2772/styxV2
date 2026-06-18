@@ -13,6 +13,22 @@ Python automation using Playwright to register accounts on `https://styxmarket.s
 ## Implementation status (Feb 2026)
 
 ### Done
+- **Feb 2026 — Fixed false-negative on TOP UP BALANCE click.** User reported:
+  funds arrived (green checkmark visible) but the script logged "Could not
+  click TOP UP BALANCE" and skipped the deposit-wait + auto-buy. Root cause:
+  (a) the click DID register, but the Vue app navigated away mid-click, so
+  Playwright bailed with `Timeout: element is not visible/stable` even though
+  the click was already on the server; (b) the final fallback
+  `button[type='submit'].last` was picking up a HIDDEN
+  `<button class="refund-modal__button">` (the refund-policy modal lives in
+  the DOM but never renders), guaranteeing a "fail" verdict.
+  Fix: every click strategy is now wrapped in a post-click state probe (QR /
+  deposit address / "protected by Styx" banner / URL change / form gone). If
+  the page has moved on, the click is treated as successful regardless of
+  what Playwright reported. The dangerous submit-button-last fallback was
+  removed; remaining strategies are constrained to `:visible` or use
+  `force=True`. Also added a pre-flight "already submitted?" check so the
+  script doesn't try to click a button that no longer exists.
 - **Feb 2026 — Post-topup auto-buy flow.** After top-up is submitted, the
   script now (1) waits up to `--deposit-timeout` seconds for on-chain
   confirmation (polls the page for: deposit-block gone + green-checkmark or
