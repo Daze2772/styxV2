@@ -1,3 +1,22 @@
+"""
+Styx Market registration automation.
+
+Key insight from debugging:
+  The previous failure ("Timeout waiting for input[name='password']") was NOT a
+  selector problem. After clicking the "Quick Verification" Continue button,
+  Cloudflare's deeper bot-check classifies playwright-stealth as a bot and
+  silently navigates to /verify which returns an "Attention Required" page
+  with ZERO inputs. The form simply never loads.
+
+Mitigations applied:
+  1. Use `patchright` (stealth-patched fork) instead of vanilla playwright.
+  2. Use `channel='chrome'` (real Chrome, not bundled Chromium) when available.
+  3. Use `launch_persistent_context` (real on-disk profile) - far more human.
+  4. Headed mode by default (headless is the #1 detection signal).
+  5. Explicit Cloudflare-block detection so failures are reported correctly.
+  6. JS-based form filling fallback that dispatches proper input/change events
+     so any reactive framework (React/Vue) registers the values.
+"""
 import argparse
 import random
 import string
@@ -5,267 +24,443 @@ import csv
 import os
 import sys
 import math
+import time
 import cv2
 import numpy as np
 from loguru import logger
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-from playwright_stealth import Stealth
 
+# patchright is a near drop-in replacement for playwright with hardened stealth
+try:
+    from patchright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+    USING_PATCHRIGHT = True
+except ImportError:
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+    USING_PATCHRIGHT = False
+
+
+# ---------- credential generation ----------------------------------------------
 def generate_random_string(length=10):
-    """Generate a random alphanumeric string."""
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
+
 def generate_password(length=14):
-    """Generate a strong password meeting standard complexity requirements."""
-    upper = random.choice(string.ascii_uppercase)
-    lower = random.choice(string.ascii_lowercase)
-    digit = random.choice(string.digits)
+    upper   = random.choice(string.ascii_uppercase)
+    lower   = random.choice(string.ascii_lowercase)
+    digit   = random.choice(string.digits)
     special = random.choice("!@#$%^&*")
-    rest = ''.join(random.choices(string.ascii_letters + string.digits + "!@#$%^&*", k=length-4))
-    pwd = list(upper + lower + digit + special + rest)
+    rest    = ''.join(random.choices(string.ascii_letters + string.digits + "!@#$%^&*", k=length - 4))
+    pwd     = list(upper + lower + digit + special + rest)
     random.shuffle(pwd)
     return ''.join(pwd)
 
+
+# ---------- clock CAPTCHA solver -----------------------------------------------
 def solve_clock(image_path):
-    """
-    Solves the analog clock captcha by analyzing the hands using OpenCV.
-    Returns the time in HH:MM format.
-    """
     img = cv2.imread(image_path)
     if img is None:
         logger.warning(f"Could not read clock image at {image_path}")
         return "12:00"
-        
+
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
-    # Threshold to extract the dark hands against the white background
-    # (Assuming clock face is white and hands are black, THRESH_BINARY_INV makes hands white for detection)
     _, thresh = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY_INV)
-    
     h, w = thresh.shape
     cx, cy = w // 2, h // 2
-    
-    # Find lines representing the hands using Probabilistic Hough Transform
-    lines = cv2.HoughLinesP(thresh, rho=1, theta=np.pi/180, threshold=30, minLineLength=20, maxLineGap=5)
-    
+
+    lines = cv2.HoughLinesP(thresh, rho=1, theta=np.pi / 180,
+                            threshold=30, minLineLength=20, maxLineGap=5)
     if lines is None:
-        logger.warning("No lines detected in the clock image.")
         return "12:00"
-        
+
     hands = []
     for line in lines:
         x1, y1, x2, y2 = line[0]
-        # Calculate perpendicular distance from center to the line
-        # This ensures the line we detect originates from the center of the clock (the hands)
-        dist = abs((y2 - y1) * cx - (x2 - x1) * cy + x2 * y1 - y2 * x1) / (math.hypot(y2 - y1, x2 - x1) + 1e-5)
-        
-        if dist < min(w, h) * 0.15: # Verify it passes close to the center
+        dist = abs((y2 - y1) * cx - (x2 - x1) * cy + x2 * y1 - y2 * x1) \
+               / (math.hypot(y2 - y1, x2 - x1) + 1e-5)
+        if dist < min(w, h) * 0.15:
             d1 = math.hypot(x1 - cx, y1 - cy)
             d2 = math.hypot(x2 - cx, y2 - cy)
             far_x, far_y = (x1, y1) if d1 > d2 else (x2, y2)
-            length = max(d1, d2)
-            hands.append({'length': length, 'x': far_x, 'y': far_y})
-            
+            hands.append({'length': max(d1, d2), 'x': far_x, 'y': far_y})
+
     if not hands:
         return "12:00"
-        
-    # Sort lines by length descending to distinguish minute (long) and hour (short) hands
-    hands.sort(key=lambda item: item['length'], reverse=True)
-    
+
+    hands.sort(key=lambda h: h['length'], reverse=True)
     min_hand = hands[0]
     hour_hand = None
-    
     for hand in hands[1:]:
-        angle1 = math.atan2(min_hand['y'] - cy, min_hand['x'] - cx)
-        angle2 = math.atan2(hand['y'] - cy, hand['x'] - cx)
-        # Ensure the hour hand is distinctly different from the minute hand (angle delta)
-        if abs(angle1 - angle2) > 0.2:
+        a1 = math.atan2(min_hand['y'] - cy, min_hand['x'] - cx)
+        a2 = math.atan2(hand['y'] - cy, hand['x'] - cx)
+        if abs(a1 - a2) > 0.2:
             hour_hand = hand
             break
-            
     if not hour_hand:
-        hour_hand = min_hand # Fallback if only one hand is clearly detected
-        
-    def get_angle(x, y, cx, cy):
-        angle = math.degrees(math.atan2(y - cy, x - cx))
-        # Shift so 12 o'clock is 0 degrees, and moves clockwise
-        angle = (angle + 90) % 360
-        return angle
-        
-    min_angle = get_angle(min_hand['x'], min_hand['y'], cx, cy)
-    hour_angle = get_angle(hour_hand['x'], hour_hand['y'], cx, cy)
-    
-    minute = int(round((min_angle / 360.0) * 60)) % 60
-    hour = int(round((hour_angle / 360.0) * 12)) % 12
+        hour_hand = min_hand
+
+    def get_angle(x, y):
+        return (math.degrees(math.atan2(y - cy, x - cx)) + 90) % 360
+
+    minute = int(round((get_angle(min_hand['x'], min_hand['y']) / 360.0) * 60)) % 60
+    hour   = int(round((get_angle(hour_hand['x'], hour_hand['y']) / 360.0) * 12)) % 12
     if hour == 0:
         hour = 12
-        
     return f"{hour:02d}:{minute:02d}"
 
-def process_registration(page, url, max_captcha_retries=3):
-    logger.info(f"Navigating to {url}")
-    page.goto(url, wait_until="domcontentloaded")
-    
-    # 1. Quick Verification (Cloudflare/DDoS check)
-    try:
-        logger.info("Looking for Quick Verification...")
-        # Use robust selectors accommodating multiple possible implementations
-        continue_btn = page.locator("button:has-text('Continue'), .continue-btn, #continue").first
-        if continue_btn.is_visible(timeout=5000):
-            continue_btn.click()
-            logger.info("Clicked 'Continue' for Quick Verification.")
-    except PlaywrightTimeoutError:
-        logger.debug("No quick verification step found or timed out, proceeding.")
 
-    # 2. Registration Form
-    logger.info("Waiting for Registration form to load...")
-    # Wait for the exact password field using the user's provided class/name
-    page.wait_for_selector("input[name='password']", state="attached", timeout=15000)
-    
-    username = f"user_{generate_random_string(8)}"
-    password = generate_password()
-    secret = generate_random_string(12)
-    
-    logger.info(f"Generated - User: {username}")
-    
+# ---------- robust form-fill helpers -------------------------------------------
+JS_SET_NATIVE_VALUE = r"""
+([selector, value]) => {
+    // Resolve - try multiple strategies including shadow DOM piercing.
+    function deepQuery(root, sel) {
+        const found = root.querySelector(sel);
+        if (found) return found;
+        const all = root.querySelectorAll('*');
+        for (const el of all) {
+            if (el.shadowRoot) {
+                const r = deepQuery(el.shadowRoot, sel);
+                if (r) return r;
+            }
+        }
+        return null;
+    }
+    const el = deepQuery(document, selector);
+    if (!el) return { ok: false, reason: 'not_found' };
+
+    // Use the native setter so frameworks (React/Vue) detect the change.
+    const proto = el.tagName === 'TEXTAREA'
+        ? window.HTMLTextAreaElement.prototype
+        : window.HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+    setter.call(el, value);
+
+    el.dispatchEvent(new Event('input',  { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    el.dispatchEvent(new Event('blur',   { bubbles: true }));
+    return { ok: true, name: el.name, type: el.type, cls: el.className };
+}
+"""
+
+
+def js_fill(page, selector, value):
+    """Fill via native JS setter + proper events so reactive frameworks update."""
+    return page.evaluate(JS_SET_NATIVE_VALUE, [selector, value])
+
+
+def smart_fill(page, candidate_selectors, value, label=""):
+    """
+    Try several strategies in order until one succeeds:
+      1) Playwright locator.fill on each candidate
+      2) JS native-setter fill (handles framework state + shadow DOM)
+    """
+    # Strategy 1 - Playwright fill
+    for sel in candidate_selectors:
+        try:
+            loc = page.locator(sel).first
+            loc.wait_for(state="attached", timeout=3000)
+            loc.scroll_into_view_if_needed(timeout=2000)
+            loc.fill(value, timeout=3000)
+            actual = loc.input_value(timeout=2000)
+            if actual == value:
+                logger.info(f"  [{label}] filled via PW selector: {sel}")
+                return True
+        except Exception as e:
+            logger.debug(f"  [{label}] PW fill failed on {sel}: {e}")
+
+    # Strategy 2 - JS native setter
+    for sel in candidate_selectors:
+        try:
+            res = js_fill(page, sel, value)
+            if res and res.get("ok"):
+                logger.info(f"  [{label}] filled via JS native setter: {sel} -> {res}")
+                return True
+        except Exception as e:
+            logger.debug(f"  [{label}] JS fill failed on {sel}: {e}")
+
+    logger.error(f"  [{label}] ALL fill strategies failed.")
+    return False
+
+
+# ---------- Cloudflare block detection -----------------------------------------
+def is_cloudflare_blocked(page):
+    """Return True if the current page is the Cloudflare 'Sorry, you have been blocked' page."""
     try:
-        # Use exact name locators with .first (as .last was matching detached/hidden elements)
-        page.locator("input[name='username']").first.fill(username, force=True, timeout=5000)
-        page.locator("input[name='password']").first.fill(password, force=True, timeout=5000)
-        
-        # Determine secret code input
-        secret_locator = page.locator("input[name='secret_code'], input[name='secret'], input[name='pin']")
-        if secret_locator.count() > 0:
-            secret_locator.first.fill(secret, force=True, timeout=5000)
-        else:
-            # Fallback to the third .input__input field
-            page.locator("input.input__input").nth(2).fill(secret, force=True, timeout=5000)
-            
-        page.locator("button:has-text('Sign up'), button[type='submit'], .sign-up__form button").first.click(force=True, timeout=5000)
-        logger.info("Submitted Registration Form.")
-    except Exception as e:
-        logger.error(f"Failed to fill and submit the form: {e}")
+        title = page.title() or ""
+        if "Attention Required" in title or "Cloudflare" in title:
+            html = page.content().lower()
+            if "sorry, you have been blocked" in html or "cf-error-details" in html:
+                return True
+        # Also check URL pattern
+        if "/verify" in page.url and "cloudflare" in (page.title() or "").lower():
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# ---------- registration flow --------------------------------------------------
+def process_registration(page, url, max_captcha_retries=3, debug_dir=None):
+    logger.info(f"Navigating to {url}")
+    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    time.sleep(2)  # let any client-side JS settle
+
+    if debug_dir:
+        page.screenshot(path=os.path.join(debug_dir, "01_landing.png"))
+
+    # 1) Quick Verification ----------------------------------------------------
+    try:
+        logger.info("Looking for Quick Verification 'Continue' button...")
+        cont = page.locator("button:has-text('Continue'), .continue-btn, #continue").first
+        if cont.is_visible(timeout=8000):
+            # Small human-like delay before clicking
+            time.sleep(random.uniform(1.2, 2.5))
+            cont.click()
+            logger.info("Clicked 'Continue'.")
+            # Loading-bar animation is ~5-6 seconds, then navigation
+            time.sleep(7)
+    except PlaywrightTimeoutError:
+        logger.debug("No Quick Verification step found, proceeding.")
+
+    # Wait for navigation/render to settle
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+
+    if debug_dir:
+        page.screenshot(path=os.path.join(debug_dir, "02_post_verify.png"))
+
+    # 2) Detect Cloudflare block ----------------------------------------------
+    if is_cloudflare_blocked(page):
+        logger.error("=" * 60)
+        logger.error("CLOUDFLARE HARD-BLOCK DETECTED.")
+        logger.error(f"Current URL: {page.url}")
+        logger.error("The form was never rendered. This is NOT a selector issue.")
+        logger.error("Try: (a) run headed, (b) channel='chrome', (c) different IP/proxy,")
+        logger.error("     (d) clear /tmp/styx_profile and let a real user solve")
+        logger.error("     the challenge once so the cookie is persisted.")
+        logger.error("=" * 60)
+        if debug_dir:
+            with open(os.path.join(debug_dir, "blocked.html"), "w") as f:
+                f.write(page.content())
         return None
 
-    # 3. Time Verification / Clock CAPTCHA
+    # 3) Registration form ----------------------------------------------------
+    logger.info("Waiting for registration form to render...")
+    try:
+        page.wait_for_selector("input.input__input, input[name='password']",
+                               state="attached", timeout=20000)
+    except PlaywrightTimeoutError:
+        logger.error("Form never appeared. Dumping page state for inspection.")
+        if debug_dir:
+            page.screenshot(path=os.path.join(debug_dir, "03_no_form.png"))
+            with open(os.path.join(debug_dir, "no_form.html"), "w") as f:
+                f.write(page.content())
+        return None
+
+    # Confirm count of inputs we can actually see
+    try:
+        info = page.evaluate("""() => {
+            const inputs = Array.from(document.querySelectorAll('input.input__input, input'));
+            return inputs.map(el => ({
+                name: el.name, type: el.type, cls: el.className,
+                visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+            }));
+        }""")
+        logger.info(f"Detected {len(info)} input(s) on the page:")
+        for i in info:
+            logger.info(f"  - {i}")
+    except Exception:
+        pass
+
+    username = f"user_{generate_random_string(8)}"
+    password = generate_password()
+    secret   = generate_random_string(12)
+    logger.info(f"Generated credentials -> user={username}")
+
+    # Multi-strategy fills. Order: most specific to most generic.
+    ok_u = smart_fill(page,
+        ["input[name='username']",
+         "form input.input__input:nth-of-type(1)",
+         "div.sign-up-form__body div:nth-child(1) input.input__input",
+         "input.input__input >> nth=0"],
+        username, label="username")
+
+    ok_p = smart_fill(page,
+        ["input[name='password']",
+         "input[type='password']",
+         "div.sign-up-form__body div:nth-child(2) input.input__input",
+         "input.input__input >> nth=1"],
+        password, label="password")
+
+    ok_s = smart_fill(page,
+        ["input[name='secret_code']", "input[name='secret']", "input[name='pin']",
+         "div.sign-up-form__body div:nth-child(3) input.input__input",
+         "input.input__input >> nth=2"],
+        secret, label="secret_code")
+
+    if debug_dir:
+        page.screenshot(path=os.path.join(debug_dir, "04_filled.png"))
+
+    if not (ok_u and ok_p and ok_s):
+        logger.error(f"Failed to fill all fields (u={ok_u} p={ok_p} s={ok_s})")
+        return None
+
+    # Submit
+    try:
+        time.sleep(random.uniform(0.5, 1.2))
+        page.locator("button:has-text('Sign up'), button[type='submit'], "
+                     ".sign-up__form button").first.click(timeout=8000)
+        logger.info("Clicked Sign up.")
+    except Exception as e:
+        logger.error(f"Failed to click Sign up: {e}")
+        return None
+
+    # 4) Clock CAPTCHA --------------------------------------------------------
     success = False
     for attempt in range(1, max_captcha_retries + 1):
         try:
-            logger.info(f"Waiting for Clock CAPTCHA (Attempt {attempt})...")
-            # Wait for the modal instruction text
-            page.wait_for_selector("text=To confirm that you are not a robot", timeout=10000)
-            
-            # Locate the clock image within the modal (it might be a canvas, svg, or img)
-            modal = page.locator("div").filter(has_text="To confirm that you are not a robot").last
+            logger.info(f"Waiting for clock CAPTCHA (attempt {attempt})...")
+            page.wait_for_selector("text=To confirm that you are not a robot",
+                                   timeout=10000)
+
+            modal = page.locator("div").filter(
+                has_text="To confirm that you are not a robot").last
             clock_el = modal.locator("canvas, img, svg").first
-            
-            clock_path = f"clock_tmp_{attempt}.png"
+
+            clock_path = os.path.join(debug_dir or ".", f"clock_{attempt}.png")
             clock_el.screenshot(path=clock_path)
-            logger.info(f"Captured clock screenshot to {clock_path}")
-            
+            logger.info(f"Clock screenshot -> {clock_path}")
+
             time_str = solve_clock(clock_path)
-            logger.info(f"Calculated Time via OpenCV: {time_str}")
-            
-            # Fill the calculated time into the input field
-            page.locator("input[placeholder='00:00'], input[name='captcha_time']").fill(time_str)
-            page.locator("button:has-text('OK')").click()
-            
-            # Wait briefly to see if modal disappears or an error appears
-            page.wait_for_timeout(2000)
-            error_msg = page.locator("text=Incorrect time, text=Error")
-            if error_msg.is_visible():
-                logger.warning("Incorrect time entered. Retrying if possible...")
+            logger.info(f"Solved time: {time_str}")
+
+            smart_fill(page,
+                ["input[placeholder='00:00']",
+                 "input[name='captcha_time']",
+                 "input.input__input"],
+                time_str, label="captcha_time")
+
+            page.locator("button:has-text('OK')").click(timeout=5000)
+            page.wait_for_timeout(2500)
+
+            err = page.locator("text=Incorrect time, text=Error")
+            if err.count() > 0 and err.first.is_visible():
+                logger.warning("Wrong time, retrying...")
                 continue
-            else:
-                logger.info("Captcha accepted!")
-                success = True
-                break
-                
+
+            logger.info("CAPTCHA accepted.")
+            success = True
+            break
+
         except PlaywrightTimeoutError:
-            # Check if there are form validation errors preventing the CAPTCHA from showing
-            error_msg = page.locator("text=This field is required, text=Error, .error-message, .invalid-feedback").first
-            if error_msg.is_visible():
-                logger.error(f"Form validation errors found: {error_msg.inner_text()}")
-                success = False
-            else:
-                logger.info("No CAPTCHA modal detected. Assuming success or site didn't prompt.")
-                success = True
+            # Look for validation errors that may have prevented CAPTCHA
+            err = page.locator(".error-message, .invalid-feedback, "
+                               "text=This field is required").first
+            if err.count() and err.is_visible():
+                logger.error(f"Form validation error: {err.inner_text()}")
+                break
+            logger.info("No CAPTCHA appeared — likely already registered.")
+            success = True
             break
         except Exception as e:
-            logger.error(f"Error solving CAPTCHA: {str(e)}")
+            logger.error(f"CAPTCHA error: {e}")
             break
 
     if success:
-        logger.success(f"Successfully registered: {username}")
-        return {
-            "url": url,
-            "username": username,
-            "password": password,
-            "secret": secret
-        }
-    else:
-        logger.error("Failed to pass registration flow.")
-        return None
+        logger.success(f"Registered: {username}")
+        return {"url": url, "username": username, "password": password, "secret": secret}
+    logger.error("Registration flow failed.")
+    return None
 
+
+# ---------- main ---------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Automate account registration on Styx Market.")
-    parser.add_argument("--url", type=str, help="Single registration URL to process.")
-    parser.add_argument("--file", type=str, help="Path to a text file containing URLs (one per line).")
-    parser.add_argument("--output", type=str, default="accounts.csv", help="Output CSV file for saved credentials.")
-    parser.add_argument("--headless", action="store_true", help="Run browser in headless mode.")
+    parser = argparse.ArgumentParser(description="Automate Styx Market registration.")
+    parser.add_argument("--url",      help="Single registration URL.")
+    parser.add_argument("--file",     help="Text file of URLs (one per line).")
+    parser.add_argument("--output",   default="accounts.csv", help="CSV output path.")
+    parser.add_argument("--headless", action="store_true",
+                        help="Run headless (NOT recommended - easily detected).")
+    parser.add_argument("--channel",  default="chrome",
+                        help="Browser channel: 'chrome' (recommended), "
+                             "'chrome-beta', 'msedge' or 'chromium'.")
+    parser.add_argument("--profile",  default="/tmp/styx_profile",
+                        help="Persistent user-data dir (keeps cookies between runs).")
+    parser.add_argument("--debug",    action="store_true",
+                        help="Save screenshots + HTML dumps to ./debug_out/")
     args = parser.parse_args()
 
     urls = []
     if args.url:
         urls.append(args.url)
-    if args.file:
-        if os.path.exists(args.file):
-            with open(args.file, 'r') as f:
-                urls.extend([line.strip() for line in f if line.strip()])
-        else:
-            logger.error(f"File not found: {args.file}")
-            sys.exit(1)
-            
+    if args.file and os.path.exists(args.file):
+        with open(args.file) as f:
+            urls.extend([ln.strip() for ln in f if ln.strip()])
     if not urls:
-        logger.info("No URL provided. Using default test URL.")
         urls.append("https://styxmarket.si/accounts/register/?ref=7QXIWQR1")
+
+    debug_dir = None
+    if args.debug:
+        debug_dir = os.path.abspath("./debug_out")
+        os.makedirs(debug_dir, exist_ok=True)
+        logger.info(f"Debug artifacts -> {debug_dir}")
+
+    logger.info(f"patchright in use: {USING_PATCHRIGHT}")
+    logger.info(f"channel={args.channel}  headless={args.headless}  profile={args.profile}")
 
     results = []
     with sync_playwright() as p:
-        # Launch browser with evasion techniques
-        browser = p.chromium.launch(
+        # launch_persistent_context is critical: it uses an on-disk profile that
+        # accumulates legitimate cookies/storage across runs — far less detectable
+        # than a fresh ephemeral context every time.
+        launch_kwargs = dict(
+            user_data_dir=args.profile,
             headless=args.headless,
-            args=["--disable-blink-features=AutomationControlled"]
+            no_viewport=True,
+            viewport=None,
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/130.0.0.0 Safari/537.36"),
+            locale="en-US",
+            timezone_id="America/New_York",
         )
-        context = browser.new_context(
-            viewport={'width': 1280, 'height': 800},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
-        )
-        
+        # Channel selection — 'chrome' uses the real installed Chrome, which
+        # is much harder to fingerprint than playwright's bundled chromium.
+        if args.channel and args.channel != "chromium":
+            launch_kwargs["channel"] = args.channel
+
+        try:
+            context = p.chromium.launch_persistent_context(**launch_kwargs)
+        except Exception as e:
+            logger.warning(f"channel='{args.channel}' failed ({e}); "
+                           f"falling back to bundled chromium.")
+            launch_kwargs.pop("channel", None)
+            context = p.chromium.launch_persistent_context(**launch_kwargs)
+
         for url in urls:
             page = context.new_page()
-            # Apply playwright-stealth to avoid bot detection
-            Stealth().apply_stealth_sync(page)
             try:
-                result = process_registration(page, url)
+                result = process_registration(page, url, debug_dir=debug_dir)
                 if result:
                     results.append(result)
             except Exception as e:
                 logger.error(f"Critical error on {url}: {e}")
             finally:
                 page.close()
-                
-        browser.close()
+
+        context.close()
 
     if results:
-        # Save successfully generated credentials to CSV
-        file_exists = os.path.isfile(args.output)
-        with open(args.output, mode='a', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=["url", "username", "password", "secret"])
-            if not file_exists:
-                writer.writeheader()
-            writer.writerows(results)
-        logger.info(f"Saved {len(results)} accounts to {args.output}")
+        new_file = not os.path.isfile(args.output)
+        with open(args.output, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["url", "username", "password", "secret"])
+            if new_file:
+                w.writeheader()
+            w.writerows(results)
+        logger.info(f"Saved {len(results)} account(s) -> {args.output}")
+    else:
+        logger.warning("No accounts saved.")
+
 
 if __name__ == "__main__":
     main()

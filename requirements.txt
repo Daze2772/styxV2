@@ -1,5 +1,6 @@
 playwright>=1.38.0
 playwright-stealth>=1.0.6
+patchright>=1.40.0
 opencv-python>=4.8.0
 numpy>=1.26.0
 loguru>=0.7.2
