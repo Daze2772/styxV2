@@ -361,8 +361,128 @@ def is_cloudflare_blocked(page):
     return False
 
 
+# ---------- post-registration: wallet top-up ----------------------------------
+def do_topup(page, amount, currency_label="BNB (BEP20)",
+             base_url="https://styxmarket.si", debug_dir=None):
+    """
+    Navigate to /wallet/top-up/, click the requested crypto tile, fill the
+    payment amount, click TOP UP BALANCE. Does NOT close the page.
+
+    Args:
+        page: Playwright Page (already logged in after registration).
+        amount: numeric payment amount (string or int).
+        currency_label: visible label on the crypto tile, e.g. "BNB (BEP20)".
+    """
+    topup_url = f"{base_url.rstrip('/')}/wallet/top-up/"
+    logger.info(f"Navigating to top-up page: {topup_url}")
+    page.goto(topup_url, wait_until="domcontentloaded", timeout=45000)
+    try:
+        page.wait_for_load_state("networkidle", timeout=10000)
+    except Exception:
+        pass
+    time.sleep(random.uniform(1.5, 2.5))
+
+    if debug_dir:
+        page.screenshot(path=os.path.join(debug_dir, "10_topup_landing.png"),
+                        full_page=True)
+
+    # 1) Click the crypto tile (e.g. "BNB (BEP20)")
+    logger.info(f"Selecting crypto: {currency_label}")
+    clicked = False
+    # Try a wide variety of selectors, role-based first (most robust).
+    strategies = [
+        lambda: page.get_by_role("button", name=currency_label, exact=True).first.click(timeout=4000),
+        lambda: page.get_by_text(currency_label, exact=True).first.click(timeout=4000),
+        lambda: page.locator(f"button:has-text('{currency_label}')").first.click(timeout=4000),
+        lambda: page.locator(f"[class*='currency']:has-text('{currency_label}')").first.click(timeout=4000),
+        lambda: page.locator(f"div:has-text('{currency_label}')").first.click(timeout=4000),
+        lambda: page.locator(f"a:has-text('{currency_label}')").first.click(timeout=4000),
+    ]
+    for i, strat in enumerate(strategies, 1):
+        try:
+            strat()
+            clicked = True
+            logger.info(f"  -> clicked '{currency_label}' (strategy {i})")
+            break
+        except Exception as e:
+            logger.debug(f"  topup tile strategy {i} failed: {e}")
+    if not clicked:
+        logger.error(f"Could not click currency tile '{currency_label}'.")
+        if debug_dir:
+            page.screenshot(path=os.path.join(debug_dir, "11_topup_no_tile.png"),
+                            full_page=True)
+        return False
+
+    time.sleep(random.uniform(0.8, 1.5))
+    if debug_dir:
+        page.screenshot(path=os.path.join(debug_dir, "12_topup_tile_selected.png"),
+                        full_page=True)
+
+    # 2) Fill the Payment Amount input
+    logger.info(f"Entering payment amount: {amount}")
+    amount_str = str(amount)
+    ok_amt = smart_fill(page,
+        ["input[name='amount']",
+         "input[name='payment_amount']",
+         "input[type='number']",
+         "[class*='payment'] input",
+         "[class*='amount'] input",
+         "input[placeholder*='mount']",
+         # last-resort: the only visible input on the top-up page
+         "input.input__input:visible",
+         "input:visible"],
+        amount_str, label="payment_amount")
+    if not ok_amt:
+        logger.error("Could not fill payment amount input.")
+        if debug_dir:
+            page.screenshot(path=os.path.join(debug_dir, "13_topup_no_amount.png"),
+                            full_page=True)
+        return False
+
+    time.sleep(random.uniform(0.5, 1.0))
+    if debug_dir:
+        page.screenshot(path=os.path.join(debug_dir, "14_topup_amount_filled.png"),
+                        full_page=True)
+
+    # 3) Click TOP UP BALANCE
+    logger.info("Clicking TOP UP BALANCE...")
+    btn_strategies = [
+        lambda: page.get_by_role("button", name="TOP UP BALANCE").first.click(timeout=5000),
+        lambda: page.get_by_role("button", name="Top up balance").first.click(timeout=5000),
+        lambda: page.locator("button:has-text('TOP UP BALANCE')").first.click(timeout=5000),
+        lambda: page.locator("button:has-text('Top up balance')").first.click(timeout=5000),
+        lambda: page.locator("button:has-text('Top up')").last.click(timeout=5000),
+        lambda: page.locator("button[type='submit']").last.click(timeout=5000),
+    ]
+    btn_clicked = False
+    for i, strat in enumerate(btn_strategies, 1):
+        try:
+            strat()
+            btn_clicked = True
+            logger.info(f"  -> clicked TOP UP BALANCE (strategy {i})")
+            break
+        except Exception as e:
+            logger.debug(f"  topup-button strategy {i} failed: {e}")
+    if not btn_clicked:
+        logger.error("Could not click TOP UP BALANCE.")
+        if debug_dir:
+            page.screenshot(path=os.path.join(debug_dir, "15_topup_no_button.png"),
+                            full_page=True)
+        return False
+
+    # Give the next page (deposit address / QR) a moment to render
+    time.sleep(3)
+    if debug_dir:
+        page.screenshot(path=os.path.join(debug_dir, "16_topup_submitted.png"),
+                        full_page=True)
+    logger.success(f"Top-up submitted: {currency_label} amount={amount}")
+    return True
+
+
 # ---------- registration flow --------------------------------------------------
-def process_registration(page, url, max_captcha_retries=3, debug_dir=None):
+def process_registration(page, url, max_captcha_retries=3, debug_dir=None,
+                         topup_amount=0, topup_currency="BNB (BEP20)",
+                         keep_open=False):
     logger.info(f"Navigating to {url}")
     page.goto(url, wait_until="domcontentloaded", timeout=60000)
     time.sleep(2)  # let any client-side JS settle
@@ -668,7 +788,45 @@ def process_registration(page, url, max_captcha_retries=3, debug_dir=None):
 
     if success:
         logger.success(f"Registered: {username}")
-        return {"url": url, "username": username, "password": password, "secret": secret}
+        result = {"url": url, "username": username,
+                  "password": password, "secret": secret}
+
+        # After successful registration the user is auto-logged-in. Optionally
+        # navigate to the wallet top-up page and submit a payment request.
+        if topup_amount and float(topup_amount) > 0:
+            logger.info("Waiting a few seconds before navigating to top-up...")
+            time.sleep(random.uniform(3.0, 5.0))
+            try:
+                # base_url derived from registration URL so it works on
+                # mirrors / staging hosts too.
+                from urllib.parse import urlparse
+                _u = urlparse(url)
+                base = f"{_u.scheme}://{_u.netloc}"
+                do_topup(page, amount=topup_amount, base_url=base,
+                         currency_label=topup_currency,
+                         debug_dir=debug_dir)
+            except Exception as e:
+                logger.error(f"Top-up flow failed: {e}")
+
+        # Keep the browser session open until the user closes the tab.
+        if keep_open:
+            logger.info("=" * 64)
+            logger.info("Session is now YOURS. Close the browser window when done.")
+            logger.info("(The script will exit automatically when you close the tab.)")
+            logger.info("=" * 64)
+            try:
+                page.wait_for_event("close", timeout=0)
+            except Exception as e:
+                logger.debug(f"wait_for_event('close') ended: {e}")
+            logger.info("Browser tab closed by user - exiting.")
+            # Persist the result BEFORE we exit, so users don't lose creds.
+            try:
+                _persist_results([result], "accounts.csv")
+            except Exception as e:
+                logger.debug(f"persist on exit failed: {e}")
+            sys.exit(0)
+
+        return result
     logger.error("Registration flow failed at CAPTCHA stage.")
     if debug_dir:
         page.screenshot(path=os.path.join(debug_dir, "99_captcha_failed.png"),
@@ -775,21 +933,33 @@ def _run_with_patchright(args, urls, debug_dir, results):
                     logger.info(f"=== {url} attempt {i + 1}/{args.count} ===")
                 page = context.new_page()
                 try:
-                    result = process_registration(page, url, debug_dir=debug_dir)
+                    result = process_registration(
+                        page, url, debug_dir=debug_dir,
+                        topup_amount=args.topup,
+                        topup_currency=args.topup_currency,
+                        keep_open=args.keep_open,
+                    )
                     if result:
                         results.append(result)
                 except Exception as e:
                     logger.error(f"Critical error on {url}: {e}")
                 finally:
-                    try:
-                        page.close()
-                    except Exception:
-                        pass
+                    if not args.keep_open:
+                        try:
+                            page.close()
+                        except Exception:
+                            pass
                 # Human-like pause between registrations
                 if args.count > 1 and i < args.count - 1:
                     time.sleep(random.uniform(4.0, 8.0))
 
-        context.close()
+        if not args.keep_open:
+            context.close()
+        else:
+            try:
+                context.close()
+            except Exception:
+                pass
 
 
 def _run_with_camoufox(args, urls, debug_dir, results):
@@ -820,16 +990,22 @@ def _run_with_camoufox(args, urls, debug_dir, results):
                     logger.info(f"=== {url} attempt {i + 1}/{args.count} ===")
                 page = context.new_page()
                 try:
-                    result = process_registration(page, url, debug_dir=debug_dir)
+                    result = process_registration(
+                        page, url, debug_dir=debug_dir,
+                        topup_amount=args.topup,
+                        topup_currency=args.topup_currency,
+                        keep_open=args.keep_open,
+                    )
                     if result:
                         results.append(result)
                 except Exception as e:
                     logger.error(f"Critical error on {url}: {e}")
                 finally:
-                    try:
-                        page.close()
-                    except Exception:
-                        pass
+                    if not args.keep_open:
+                        try:
+                            page.close()
+                        except Exception:
+                            pass
                 if args.count > 1 and i < args.count - 1:
                     time.sleep(random.uniform(4.0, 8.0))
 
@@ -870,6 +1046,19 @@ def main():
                              "strongest open-source Cloudflare bypass).")
     parser.add_argument("--count",    type=int, default=1,
                         help="How many accounts to register per URL.")
+    parser.add_argument("--topup",    type=float, default=0,
+                        help="If > 0, after registration: navigate to the wallet "
+                             "top-up page, select the crypto from --topup-currency, "
+                             "enter this amount and click TOP UP BALANCE. "
+                             "Default: 0 (skip top-up).")
+    parser.add_argument("--topup-currency", default="BNB (BEP20)",
+                        help="Crypto tile label to click on the top-up page. "
+                             "Examples: 'BNB (BEP20)', 'USDT (TRC20)', 'Bitcoin', "
+                             "'Ethereum (ERC20)'.")
+    parser.add_argument("--keep-open", action="store_true",
+                        help="After all actions complete, leave the browser open "
+                             "until you manually close the tab. The script blocks "
+                             "until the page is closed.")
     args = parser.parse_args()
 
     # Auto-detect real Chrome profile path if requested
@@ -933,15 +1122,22 @@ def main():
         _run_with_patchright(args, urls, debug_dir, results)
 
     if results:
-        new_file = not os.path.isfile(args.output)
-        with open(args.output, "a", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["url", "username", "password", "secret"])
-            if new_file:
-                w.writeheader()
-            w.writerows(results)
-        logger.info(f"Saved {len(results)} account(s) -> {args.output}")
+        _persist_results(results, args.output)
     else:
         logger.warning("No accounts saved.")
+
+
+def _persist_results(results, output_path):
+    """Append accounts to the CSV (creates with header if needed)."""
+    if not results:
+        return
+    new_file = not os.path.isfile(output_path)
+    with open(output_path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["url", "username", "password", "secret"])
+        if new_file:
+            w.writeheader()
+        w.writerows(results)
+    logger.info(f"Saved {len(results)} account(s) -> {output_path}")
 
 
 if __name__ == "__main__":

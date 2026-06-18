@@ -64,6 +64,13 @@ python styx_register.py --fresh-profile
 # Use your real installed Chrome profile (cookies, history → looks human):
 # WARNING: close all your Chrome windows first.
 python styx_register.py --use-real-chrome-profile
+
+# Register, then auto-load /wallet/top-up/, select BNB (BEP20), enter 15,
+# click TOP UP BALANCE, and leave the browser open until you close the tab:
+python styx_register.py --topup 15 --keep-open
+
+# Same flow with a different crypto:
+python styx_register.py --topup 25 --topup-currency "USDT (TRC20)" --keep-open
 ```
 
 ---
