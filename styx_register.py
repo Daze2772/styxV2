@@ -965,10 +965,526 @@ def do_topup(page, amount, currency_label="BNB (BEP20)",
     return True
 
 
+def wait_for_deposit_confirmed(page, timeout_seconds=900, poll_interval=5,
+                               debug_dir=None):
+    """Block until Styx's top-up page shows a "deposit received / confirmed"
+    state.
+
+    On Styx the post-submit page shows a deposit-address block (QR code +
+    address + amount). When the on-chain transaction is detected, this whole
+    block is replaced by a green checkmark / success message. We poll the DOM
+    for either signal:
+
+       (1) the deposit-address block / QR / "send X to this address" text
+           HAS DISAPPEARED, AND
+       (2) a positive indicator appears: success-class element, a checkmark
+           icon, or text like 'received', 'confirmed', 'success', 'thank you',
+           'completed', 'deposited'.
+
+    Either signal is enough to consider deposit confirmed (we OR them, then
+    AND with a sanity-check that we're not looking at an error page).
+
+    Returns True on confirmation, False on timeout / error page.
+    """
+    logger.info(f"Waiting for deposit confirmation (timeout={timeout_seconds}s)...")
+    deadline = time.time() + max(30, int(timeout_seconds))
+    last_state = None
+    poll = 0
+    while time.time() < deadline:
+        poll += 1
+        try:
+            state = page.evaluate(
+                """() => {
+                    const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+                    const bodyText = norm(document.body ? document.body.innerText : '');
+                    const lo = bodyText.toLowerCase();
+
+                    // (a) deposit-block visible? Look for QR canvas/img,
+                    //     wallet address (long hex/base58 string), or a
+                    //     "pending" / "waiting" / "send to this address" hint.
+                    const hasQR = !!document.querySelector(
+                        'canvas, img[src*="qr"], img[alt*="QR" i], svg[class*="qr" i], [class*="qr-code"], [class*="qrcode"]');
+                    // crude wallet-address regex: 20+ alphanumeric chars with
+                    // at least one digit and one letter, on its own (no spaces)
+                    const addrRx = /\\b[a-zA-Z0-9]{25,}\\b/;
+                    const hasAddress = addrRx.test(bodyText);
+                    const hasPending = /(awaiting|pending|waiting for (the )?(payment|transaction|deposit)|send (the )?(exact|payment|amount)|deposit address|send to (this|the following))/i.test(bodyText);
+                    const hasCopyBtn = !!document.querySelector(
+                        '[class*="copy"], button[title*="copy" i], [aria-label*="copy" i]');
+
+                    const depositBlockVisible = hasQR || hasAddress || hasPending || hasCopyBtn;
+
+                    // (b) positive success indicator?
+                    const successText = /(deposit (was )?(received|confirmed|successful|completed)|payment (was )?(received|confirmed|successful|completed)|transaction (was )?(received|confirmed|successful|completed)|thank you|balance (has been )?(topped up|credited|updated)|funds received)/i.test(bodyText);
+                    const successClass = !!document.querySelector(
+                        '.success, .is-success, [class*="success"], [class*="confirmed"], [class*="completed"], [class*="received"], [class*="paid"]');
+                    // big green checkmark - look for SVG paths drawing a check,
+                    // or a font-awesome / lucide check icon, with green color
+                    // applied via CSS.
+                    const checkmark = (() => {
+                        const candidates = Array.from(document.querySelectorAll(
+                            'svg, i.fa-check, i.fa-circle-check, i[class*="check"], [class*="check"][class*="mark"], [class*="checkmark"]'
+                        ));
+                        for (const el of candidates) {
+                            try {
+                                const cs = getComputedStyle(el);
+                                const color = (cs.color || '') + ' ' + (cs.fill || '') + ' ' + (cs.stroke || '');
+                                // crude green check: any rgb(.., >=128, ..) where green > red and green > blue.
+                                const m = color.match(/rgb\\((\\d+),\\s*(\\d+),\\s*(\\d+)/);
+                                if (m) {
+                                    const r = +m[1], g = +m[2], b = +m[3];
+                                    if (g >= 120 && g > r && g > b) return true;
+                                }
+                                // class-based green hint
+                                const cls = (el.className && el.className.toString)
+                                              ? el.className.toString() : '';
+                                if (/(green|success|emerald)/i.test(cls)) return true;
+                            } catch (e) {}
+                        }
+                        return false;
+                    })();
+
+                    // Hard "error" signals - if the page shows an explicit
+                    // error/expired/cancelled state, we should NOT report
+                    // confirmed.
+                    const hasError = /(expired|cancell?ed|failed|rejected|not received yet|insufficient|under-paid|underpayment)/i.test(bodyText);
+
+                    return {
+                        depositBlockVisible: depositBlockVisible,
+                        successText: successText,
+                        successClass: successClass,
+                        checkmark: checkmark,
+                        hasError: hasError,
+                        urlPath: location.pathname,
+                        textLen: bodyText.length,
+                    };
+                }"""
+            )
+        except Exception as e:
+            logger.debug(f"  deposit-state probe failed: {e}")
+            time.sleep(poll_interval)
+            continue
+
+        if state != last_state:
+            logger.info(f"  deposit state poll #{poll}: {state}")
+            last_state = state
+
+        if state.get("hasError"):
+            logger.error(f"  Deposit page shows an ERROR state: {state}")
+            if debug_dir:
+                page.screenshot(path=os.path.join(debug_dir, "17_deposit_error.png"),
+                                full_page=True)
+            return False
+
+        # Confirmed = success indicator present AND (deposit block gone OR
+        # explicit success text). We're strict here so we don't false-positive
+        # on the initial page render (which has a green padlock somewhere).
+        confirmed = (
+            state.get("successText")
+            or (state.get("checkmark") and not state.get("depositBlockVisible"))
+            or (state.get("successClass") and not state.get("depositBlockVisible") and state.get("checkmark"))
+        )
+        if confirmed:
+            logger.success(f"  Deposit CONFIRMED at poll #{poll}: {state}")
+            if debug_dir:
+                page.screenshot(path=os.path.join(debug_dir, "17_deposit_confirmed.png"),
+                                full_page=True)
+            return True
+
+        time.sleep(poll_interval)
+
+    logger.warning(f"Deposit confirmation timed out after {timeout_seconds}s.")
+    if debug_dir:
+        page.screenshot(path=os.path.join(debug_dir, "17_deposit_timeout.png"),
+                        full_page=True)
+    return False
+
+
+def do_buy_product(page, seller_url, product_name, debug_dir=None):
+    """Navigate to a seller's profile page, find a product by name, add it to
+    the cart via the row's small shopping-cart icon, then open the header
+    cart, click Buy, and confirm Yes.
+
+    Args:
+        page: Playwright Page (already logged in).
+        seller_url: seller profile URL, e.g.
+            "https://styxmarket.si/accounts/profile/SCENARIO/?vue=true&user_id=28868"
+        product_name: visible product label, e.g. "Firstmail.ltd E-Mail Accounts".
+        debug_dir: optional dir for screenshots.
+
+    Returns True on success.
+    """
+    logger.info(f"Navigating to seller page for purchase: {seller_url}")
+    try:
+        page.goto(seller_url, wait_until="domcontentloaded", timeout=45000)
+    except Exception as e:
+        logger.error(f"Failed to open seller page: {e}")
+        return False
+    try:
+        page.wait_for_load_state("networkidle", timeout=10000)
+    except Exception:
+        pass
+    time.sleep(random.uniform(1.5, 2.5))
+
+    if debug_dir:
+        page.screenshot(path=os.path.join(debug_dir, "20_seller_page.png"),
+                        full_page=True)
+
+    # --- 1) Find the product row & click its cart-icon -----------------------
+    # Strategy: find any element whose visible text contains the product name,
+    # walk up to the nearest "row" container (the seller's product card), then
+    # find a cart-shaped element inside it. The cart icon is typically:
+    #   <svg class="...cart..."> or <i class="...cart...">, or a button with
+    #   data-tip / aria-label / title containing "cart" / "add to cart".
+    logger.info(f"Locating product row: '{product_name}'")
+    found = page.evaluate(
+        """({label}) => {
+            const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+            const want = norm(label).toLowerCase();
+
+            // 1) Find any element whose visible text starts-with or contains
+            //    the product name. Truncated text (e.g. "Firstmail.ltd E-Mail
+            //    Ac...") needs prefix match too.
+            const all = Array.from(document.querySelectorAll('div, span, p, a, h1, h2, h3, h4, h5, button'));
+            const wantPrefix = want.slice(0, Math.min(want.length, 18));
+            let matched = all.find(el => {
+                const own = norm(Array.from(el.childNodes)
+                    .filter(n => n.nodeType === 3)
+                    .map(n => n.textContent).join('')).toLowerCase();
+                if (!own) return false;
+                return own === want
+                    || own.startsWith(wantPrefix)
+                    || own.includes(wantPrefix);
+            });
+            if (!matched) {
+                // Fallback: descendant text match anywhere in the tree.
+                matched = all.find(el => {
+                    const t = norm(el.textContent || '').toLowerCase();
+                    return t.includes(wantPrefix) && t.length < want.length + 80;
+                });
+            }
+            if (!matched) {
+                const labels = all.filter(el => {
+                    const own = norm(Array.from(el.childNodes)
+                        .filter(n => n.nodeType === 3)
+                        .map(n => n.textContent).join(''));
+                    return own && own.length > 6 && own.length < 80;
+                }).map(el => norm(Array.from(el.childNodes)
+                        .filter(n => n.nodeType === 3)
+                        .map(n => n.textContent).join('')))
+                  .slice(0, 30);
+                return { ok: false, reason: 'no product text match', sampleLabels: labels };
+            }
+
+            // 2) Walk up to the row container. Prefer ancestors with class
+            //    containing 'product', 'card', 'item', or 'row'. We REQUIRE
+            //    moving up at least one level (the matched element itself is
+            //    the product name/label, not the row) and that the candidate
+            //    is meaningfully wider than the matched text (the actual row
+            //    spans the full content width, ~600px+, not just the label).
+            const rowRx = /product|card|item|row|tile|listing/i;
+            const matchedRect = matched.getBoundingClientRect();
+            let row = null;
+            let cur = matched.parentElement;  // skip matched itself
+            for (let i = 0; i < 8 && cur; i++) {
+                const cls = (cur.className && cur.className.toString)
+                                ? cur.className.toString() : '';
+                const rr = cur.getBoundingClientRect();
+                // Filter out per-cell wrappers like .product-name / .item-title
+                // which would otherwise match the rowRx. The real row is at
+                // least ~1.5x wider than the matched label.
+                if (rowRx.test(cls)
+                    && rr.width > Math.max(400, matchedRect.width * 1.3)
+                    && rr.height >= 30 && rr.height < 250) {
+                    row = cur;
+                    break;
+                }
+                cur = cur.parentElement;
+            }
+            // Fallback: take a generous-sized ancestor (whole product row is
+            // usually 800+px wide on desktop).
+            if (!row) {
+                cur = matched.parentElement;
+                for (let i = 0; i < 8 && cur; i++) {
+                    const r = cur.getBoundingClientRect();
+                    if (r.width > 500 && r.height > 40 && r.height < 250
+                        && r.width > matchedRect.width * 1.3) {
+                        row = cur; break;
+                    }
+                    cur = cur.parentElement;
+                }
+            }
+            if (!row) return { ok: false, reason: 'no row ancestor',
+                                productText: norm(matched.textContent).slice(0, 80) };
+
+            // 3) Find a cart-shaped element INSIDE this row, not the header.
+            //    Try class names and aria/title/SVG path heuristics.
+            const cartRx = /(^|[\\s_-])cart([\\s_-]|$)|shopping[-_]?cart|add[-_]?to[-_]?cart|buy[-_]?now|basket/i;
+            const candidates = Array.from(row.querySelectorAll(
+                'svg, i, button, a, span, div'));
+            const isCarty = (el) => {
+                if (!el) return false;
+                const cls = (el.className && el.className.toString)
+                                ? el.className.toString() : '';
+                if (cartRx.test(cls)) return true;
+                const al = el.getAttribute && (
+                    el.getAttribute('aria-label') || el.getAttribute('title') ||
+                    el.getAttribute('data-tip')   || el.getAttribute('data-tooltip') || '');
+                if (al && cartRx.test(al)) return true;
+                // SVG icon: look for cart-ish path data
+                if (el.tagName === 'SVG' || el.tagName === 'svg') {
+                    const paths = el.querySelectorAll('path');
+                    for (const p of paths) {
+                        const d = p.getAttribute('d') || '';
+                        // crude: cart icons often start with M2-M3 (moving to
+                        // the left of viewBox) and have a width >20 units.
+                        if (d.length > 40 && /M[0-9]/.test(d)) {
+                            // accept; many false positives but we'll filter
+                            // by position below.
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            };
+            // Filter: must be visible and inside row.
+            let cart = candidates.find(el => {
+                if (!isCarty(el)) return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 5 && r.height > 5;
+            });
+
+            // If the matched element is an inner SVG/icon, walk up to the
+            // button/anchor parent which is more reliably clickable.
+            if (cart) {
+                let up = cart;
+                for (let i = 0; i < 4; i++) {
+                    if (!up || !up.parentElement) break;
+                    const p = up.parentElement;
+                    const tag = p.tagName && p.tagName.toLowerCase();
+                    if (tag === 'button' || tag === 'a' || (p.onclick != null)) {
+                        cart = p; break;
+                    }
+                    up = p;
+                }
+            }
+
+            if (!cart) {
+                // Diagnostic dump: what's in this row?
+                const inv = Array.from(row.querySelectorAll('*'))
+                    .filter(el => {
+                        const cls = (el.className && el.className.toString)
+                                        ? el.className.toString() : '';
+                        return cls && cls.length < 100;
+                    })
+                    .slice(0, 25)
+                    .map(el => ({
+                        tag: el.tagName,
+                        cls: el.className.toString().slice(0, 80),
+                        aria: el.getAttribute && el.getAttribute('aria-label'),
+                        title: el.getAttribute && el.getAttribute('title'),
+                    }));
+                return { ok: false, reason: 'no cart icon in row',
+                         productText: norm(matched.textContent).slice(0, 80),
+                         rowCls: row.className.toString().slice(0, 100),
+                         rowItems: inv };
+            }
+
+            try { cart.scrollIntoView({block: 'center', inline: 'center'}); } catch (e) {}
+            const cr = cart.getBoundingClientRect();
+            return {
+                ok: true,
+                x: cr.left + cr.width / 2,
+                y: cr.top + cr.height / 2,
+                w: cr.width, h: cr.height,
+                tag: cart.tagName,
+                cls: (cart.className && cart.className.toString)
+                        ? cart.className.toString().slice(0, 100) : '',
+                productText: norm(matched.textContent).slice(0, 80),
+            };
+        }""",
+        {"label": product_name},
+    )
+    logger.info(f"  product lookup result: {found}")
+    if not (found and found.get("ok")):
+        logger.error(f"Could not find product '{product_name}' or its cart icon.")
+        if debug_dir:
+            page.screenshot(path=os.path.join(debug_dir, "21_no_product.png"),
+                            full_page=True)
+        return False
+
+    # Click the row-cart icon via trusted page.mouse.click at the bbox center.
+    try:
+        jx = float(found["x"]) + random.uniform(-2.0, 2.0)
+        jy = float(found["y"]) + random.uniform(-2.0, 2.0)
+        page.mouse.move(jx, jy, steps=random.randint(8, 14))
+        time.sleep(random.uniform(0.1, 0.25))
+        page.mouse.click(jx, jy, delay=random.randint(40, 90))
+        logger.info(f"  -> clicked row cart icon for '{product_name}' at ({jx:.1f},{jy:.1f})")
+    except Exception as e:
+        logger.error(f"  failed to click row cart icon: {e}")
+        return False
+
+    time.sleep(random.uniform(0.8, 1.4))
+    if debug_dir:
+        page.screenshot(path=os.path.join(debug_dir, "22_added_to_cart.png"),
+                        full_page=True)
+
+    # --- 2) Open the header cart ---------------------------------------------
+    # The site header (top-right) has icons:  flag | mail | bell | CART | menu.
+    # The cart icon usually carries a badge with the item count.
+    logger.info("Opening header cart...")
+    header_cart = page.evaluate(
+        """() => {
+            // Find an element in the top-area of the page (small y, large x)
+            // that looks cart-shaped. Filter by position to avoid clicking
+            // the row-cart icon again.
+            const vh = window.innerHeight;
+            const vw = window.innerWidth;
+            const cartRx = /(^|[\\s_-])cart([\\s_-]|$)|shopping[-_]?cart|basket|header-?cart/i;
+            const all = Array.from(document.querySelectorAll('a, button, svg, div, span, i'));
+            // candidates near the top header area: y < 120, x > vw/2.
+            const cands = all.filter(el => {
+                const r = el.getBoundingClientRect();
+                if (r.top > 140 || r.bottom < 0 || r.width < 8 || r.height < 8) return false;
+                if (r.left < vw * 0.4) return false;
+                const cls = (el.className && el.className.toString) ? el.className.toString() : '';
+                const al = el.getAttribute && (
+                    el.getAttribute('aria-label') || el.getAttribute('title') ||
+                    el.getAttribute('data-tip')   || el.getAttribute('data-tooltip') || '');
+                return cartRx.test(cls) || (al && cartRx.test(al));
+            });
+            // Prefer the one closest to the top-right corner.
+            cands.sort((a, b) => {
+                const ra = a.getBoundingClientRect();
+                const rb = b.getBoundingClientRect();
+                const da = Math.hypot(vw - ra.right, ra.top);
+                const db = Math.hypot(vw - rb.right, rb.top);
+                return da - db;
+            });
+            // Walk up to a clickable parent (button/a) if we landed on an svg.
+            let target = cands[0];
+            if (target) {
+                let cur = target;
+                for (let i = 0; i < 4 && cur && cur.parentElement; i++) {
+                    const p = cur.parentElement;
+                    const tag = (p.tagName || '').toLowerCase();
+                    if (tag === 'button' || tag === 'a' || p.onclick != null) {
+                        target = p; break;
+                    }
+                    cur = p;
+                }
+            }
+            if (!target) return { ok: false, reason: 'no header-cart candidate' };
+            try { target.scrollIntoView({block: 'center'}); } catch (e) {}
+            const r = target.getBoundingClientRect();
+            return {
+                ok: true,
+                x: r.left + r.width / 2,
+                y: r.top + r.height / 2,
+                w: r.width, h: r.height,
+                tag: target.tagName,
+                cls: (target.className && target.className.toString)
+                        ? target.className.toString().slice(0, 100) : '',
+            };
+        }"""
+    )
+    logger.info(f"  header-cart lookup: {header_cart}")
+    if not (header_cart and header_cart.get("ok")):
+        logger.error("Could not locate header cart icon.")
+        if debug_dir:
+            page.screenshot(path=os.path.join(debug_dir, "23_no_header_cart.png"),
+                            full_page=True)
+        return False
+
+    try:
+        jx = float(header_cart["x"]) + random.uniform(-2.0, 2.0)
+        jy = float(header_cart["y"]) + random.uniform(-2.0, 2.0)
+        page.mouse.move(jx, jy, steps=random.randint(8, 14))
+        time.sleep(random.uniform(0.1, 0.25))
+        page.mouse.click(jx, jy, delay=random.randint(40, 90))
+        logger.info(f"  -> clicked header cart at ({jx:.1f},{jy:.1f})")
+    except Exception as e:
+        logger.error(f"  failed to click header cart: {e}")
+        return False
+
+    time.sleep(random.uniform(1.0, 1.6))
+    if debug_dir:
+        page.screenshot(path=os.path.join(debug_dir, "24_cart_open.png"),
+                        full_page=True)
+
+    # --- 3) Click "Buy" ------------------------------------------------------
+    logger.info("Clicking 'Buy' in cart...")
+    buy_strategies = [
+        lambda: page.get_by_role("button", name="Buy", exact=True).first.click(timeout=5000),
+        lambda: page.get_by_role("button", name="BUY", exact=True).first.click(timeout=5000),
+        lambda: page.locator("button:has-text('Buy')").first.click(timeout=5000),
+        lambda: page.locator("button:has-text('BUY')").first.click(timeout=5000),
+        # Force-click as fallback (handles overlay interceptors).
+        lambda: page.locator("button:has-text('Buy')").first.click(timeout=5000, force=True),
+        lambda: page.get_by_text("Buy", exact=True).first.click(timeout=5000, force=True),
+    ]
+    buy_clicked = False
+    for i, s in enumerate(buy_strategies, 1):
+        try:
+            s()
+            buy_clicked = True
+            logger.info(f"  -> clicked Buy (strategy {i})")
+            break
+        except Exception as e:
+            logger.debug(f"  Buy strategy {i} failed: {e}")
+    if not buy_clicked:
+        logger.error("Could not click 'Buy' button in cart.")
+        if debug_dir:
+            page.screenshot(path=os.path.join(debug_dir, "25_no_buy_btn.png"),
+                            full_page=True)
+        return False
+
+    time.sleep(random.uniform(0.8, 1.3))
+    if debug_dir:
+        page.screenshot(path=os.path.join(debug_dir, "26_after_buy.png"),
+                        full_page=True)
+
+    # --- 4) Confirm with "Yes" on the "Are you sure?" modal ------------------
+    logger.info("Confirming 'Yes' on 'Are you sure?'...")
+    yes_strategies = [
+        lambda: page.get_by_role("button", name="Yes", exact=True).first.click(timeout=5000),
+        lambda: page.get_by_role("button", name="YES", exact=True).first.click(timeout=5000),
+        lambda: page.locator("button:has-text('Yes')").first.click(timeout=5000),
+        lambda: page.locator("button:has-text('YES')").first.click(timeout=5000),
+        lambda: page.locator("button:has-text('Yes')").first.click(timeout=5000, force=True),
+        lambda: page.get_by_text("Yes", exact=True).first.click(timeout=5000, force=True),
+    ]
+    yes_clicked = False
+    for i, s in enumerate(yes_strategies, 1):
+        try:
+            s()
+            yes_clicked = True
+            logger.info(f"  -> clicked Yes (strategy {i})")
+            break
+        except Exception as e:
+            logger.debug(f"  Yes strategy {i} failed: {e}")
+    if not yes_clicked:
+        logger.error("Could not click 'Yes' on confirmation modal.")
+        if debug_dir:
+            page.screenshot(path=os.path.join(debug_dir, "27_no_yes_btn.png"),
+                            full_page=True)
+        return False
+
+    time.sleep(random.uniform(1.5, 2.5))
+    if debug_dir:
+        page.screenshot(path=os.path.join(debug_dir, "28_purchase_submitted.png"),
+                        full_page=True)
+    logger.success(f"Purchase submitted for '{product_name}'.")
+    return True
+
+
 # ---------- registration flow --------------------------------------------------
 def process_registration(page, url, max_captcha_retries=3, debug_dir=None,
                          topup_amount=0, topup_currency="BNB (BEP20)",
-                         keep_open=False, keep_session=False):
+                         keep_open=False, keep_session=False,
+                         buy_seller_url=None, buy_product_name=None,
+                         deposit_timeout=900):
     if not keep_session:
         _reset_site_session(page, url)
 
@@ -1291,11 +1807,39 @@ def process_registration(page, url, max_captcha_retries=3, debug_dir=None,
                 from urllib.parse import urlparse
                 _u = urlparse(url)
                 base = f"{_u.scheme}://{_u.netloc}"
-                do_topup(page, amount=topup_amount, base_url=base,
-                         currency_label=topup_currency,
-                         debug_dir=debug_dir)
+                topup_ok = do_topup(page, amount=topup_amount, base_url=base,
+                                    currency_label=topup_currency,
+                                    debug_dir=debug_dir)
             except Exception as e:
                 logger.error(f"Top-up flow failed: {e}")
+                topup_ok = False
+
+            # If a buy-flow is requested AND top-up was submitted, wait for
+            # the deposit to be confirmed on-chain, then proceed to the
+            # seller page and purchase.
+            if topup_ok and buy_product_name and buy_seller_url:
+                try:
+                    confirmed = wait_for_deposit_confirmed(
+                        page,
+                        timeout_seconds=deposit_timeout,
+                        debug_dir=debug_dir,
+                    )
+                except Exception as e:
+                    logger.error(f"Deposit-wait crashed: {e}")
+                    confirmed = False
+                if confirmed:
+                    try:
+                        do_buy_product(page,
+                                       seller_url=buy_seller_url,
+                                       product_name=buy_product_name,
+                                       debug_dir=debug_dir)
+                    except Exception as e:
+                        logger.error(f"Buy-flow crashed: {e}")
+                else:
+                    logger.warning(
+                        "Skipping buy-flow because deposit was not confirmed. "
+                        "The browser stays open so you can complete it manually."
+                    )
 
         # Keep the browser session open until the user closes the tab.
         if keep_open:
@@ -1434,6 +1978,9 @@ def _run_with_patchright(args, urls, debug_dir, results, results_lock, profile_d
                         topup_currency=args.topup_currency,
                         keep_open=args.keep_open,
                         keep_session=args.keep_session,
+                        buy_seller_url=args.buy_seller_url if args.buy_after_topup else None,
+                        buy_product_name=args.buy_product if args.buy_after_topup else None,
+                        deposit_timeout=args.deposit_timeout,
                     )
                     if result:
                         with results_lock:
@@ -1491,6 +2038,9 @@ def _run_with_camoufox(args, urls, debug_dir, results, results_lock, profile_dir
                         topup_currency=args.topup_currency,
                         keep_open=args.keep_open,
                         keep_session=args.keep_session,
+                        buy_seller_url=args.buy_seller_url if args.buy_after_topup else None,
+                        buy_product_name=args.buy_product if args.buy_after_topup else None,
+                        deposit_timeout=args.deposit_timeout,
                     )
                     if result:
                         with results_lock:
@@ -1631,6 +2181,33 @@ def main():
                              "profile lock won't collide. Total accounts "
                              "registered = --threads * --count * (URLs). "
                              "Default 1 (sequential).")
+    # ----- Post-topup auto-buy flow ------------------------------------------
+    # After top-up is submitted, optionally wait for the deposit to be
+    # confirmed on-chain (deposit block disappears + green checkmark) and
+    # then auto-purchase a product from a seller page.
+    parser.add_argument("--buy-after-topup",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="After top-up is submitted, wait for the deposit "
+                             "to be confirmed on-chain, then auto-buy the "
+                             "product specified by --buy-product on the "
+                             "seller page at --buy-seller-url. "
+                             "Default: ON. Pass --no-buy-after-topup to skip.")
+    parser.add_argument("--buy-seller-url",
+                        default="https://styxmarket.si/accounts/profile/"
+                                "SCENARIO/?vue=true&user_id=28868",
+                        help="Seller-profile URL to navigate to for the "
+                             "auto-buy step. Default: SCENARIO's page.")
+    parser.add_argument("--buy-product",
+                        default="Firstmail.ltd E-Mail Accounts",
+                        help="Visible product name to find on the seller "
+                             "page. The script clicks the small cart icon "
+                             "in this row to add it to the cart, then opens "
+                             "the header cart, clicks Buy, and confirms Yes. "
+                             "Default: 'Firstmail.ltd E-Mail Accounts'.")
+    parser.add_argument("--deposit-timeout", type=int, default=900,
+                        help="Max seconds to wait for the deposit to be "
+                             "confirmed on-chain before giving up on the "
+                             "auto-buy step. Default: 900 (15 minutes).")
     args = parser.parse_args()
 
     # Auto-detect real Chrome profile path if requested

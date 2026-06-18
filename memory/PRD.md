@@ -13,6 +13,17 @@ Python automation using Playwright to register accounts on `https://styxmarket.s
 ## Implementation status (Feb 2026)
 
 ### Done
+- **Feb 2026 — Post-topup auto-buy flow.** After top-up is submitted, the
+  script now (1) waits up to `--deposit-timeout` seconds for on-chain
+  confirmation (polls the page for: deposit-block gone + green-checkmark or
+  "received/confirmed/successful" text), then (2) navigates to
+  `--buy-seller-url`, finds the `--buy-product` row, clicks the row's small
+  cart icon, opens the header cart, clicks **Buy**, confirms **Yes** on the
+  "Are you sure?" modal, and leaves the window open. All clicks use trusted
+  events (Playwright native click or `page.mouse.click`). The product/cart
+  heuristics were unit-tested against a synthetic Styx DOM in
+  `/app/tests/test_buy_product.js` (3/3 PASS). Defaults are SCENARIO's seller
+  page + "Firstmail.ltd E-Mail Accounts"; both override-able via CLI flags.
 - **Feb 2026 — Fixed BNB → TRX top-up tile selection bug (round 2).** First fix
   replaced JS `dispatchEvent` with Playwright native `.click()` on
   `.wallet-currency-toggler`, but that element is rendered with `display: contents`
