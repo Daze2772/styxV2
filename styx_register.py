@@ -1602,22 +1602,31 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None):
             logger.debug(f"  click on candidate #{idx} failed: {e}")
             continue
 
-        # Give the page a moment to update the badge / open a popup.
-        time.sleep(random.uniform(0.8, 1.4))
-        after_badge = _read_cart_badge()
-        after_n = (after_badge or {}).get("count") if after_badge else None
-        logger.info(f"  header cart badge AFTER candidate #{idx}: {after_badge}")
-
-        # Success criterion: badge count went UP. If we couldn't read a
-        # numeric count before/after but the badge now exists with count>=1
-        # while it was 0 before, that's also a win.
+        # Poll the header cart badge for up to ~20s waiting for it to
+        # increment. The server-side add-to-cart can take 5-10s on Styx
+        # (previously this was a single read after ~1.3s, so we gave up
+        # while the request was still in flight).
+        poll_deadline = time.time() + 20.0
+        last_after_badge = None
         added = False
-        if (isinstance(after_n, int) and isinstance(before_n, int)
-                and after_n > before_n):
-            added = True
-        elif (after_n is not None and after_n >= 1
-              and (before_n is None or before_n == 0)):
-            added = True
+        while time.time() < poll_deadline:
+            time.sleep(0.6)
+            last_after_badge = _read_cart_badge()
+            after_n = (last_after_badge or {}).get("count") if last_after_badge else None
+            if (isinstance(after_n, int) and isinstance(before_n, int)
+                    and after_n > before_n):
+                added = True
+                break
+            if (after_n is not None and after_n >= 1
+                  and (before_n is None or before_n == 0)):
+                added = True
+                break
+        after_badge = last_after_badge
+        after_n = (after_badge or {}).get("count") if after_badge else None
+        logger.info(
+            f"  header cart badge AFTER candidate #{idx} (polled "
+            f"{(time.time() - (poll_deadline - 20.0)):.1f}s): {after_badge}"
+        )
 
         if added:
             add_ok = True
