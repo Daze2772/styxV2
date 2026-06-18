@@ -1097,19 +1097,20 @@ def main():
                              "strongest open-source Cloudflare bypass).")
     parser.add_argument("--count",    type=int, default=1,
                         help="How many accounts to register per URL.")
-    parser.add_argument("--topup",    type=float, default=0,
-                        help="If > 0, after registration: navigate to the wallet "
+    parser.add_argument("--topup",    type=float, default=15,
+                        help="After registration: navigate to the wallet "
                              "top-up page, select the crypto from --topup-currency, "
                              "enter this amount and click TOP UP BALANCE. "
-                             "Default: 0 (skip top-up).")
+                             "Pass 0 to skip the top-up step. Default: 15.")
     parser.add_argument("--topup-currency", default="BNB (BEP20)",
                         help="Crypto tile label to click on the top-up page. "
                              "Examples: 'BNB (BEP20)', 'USDT (TRC20)', 'Bitcoin', "
                              "'Ethereum (ERC20)'.")
-    parser.add_argument("--keep-open", action="store_true",
-                        help="After all actions complete, leave the browser open "
-                             "until you manually close the tab. The script blocks "
-                             "until the page is closed.")
+    parser.add_argument("--keep-open", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Leave the browser open after the top-up is "
+                             "submitted, until you manually close the tab. "
+                             "Default: ON. Pass --no-keep-open to auto-close.")
     parser.add_argument("--keep-session", action="store_true",
                         help="Skip the per-run cookie/localStorage reset for the "
                              "target site. By default the script clears Styx "
