@@ -24,18 +24,38 @@ import csv
 import os
 import sys
 import math
+import tempfile
 import time
 import cv2
 import numpy as np
 from loguru import logger
 
-# patchright is a near drop-in replacement for playwright with hardened stealth
+# patchright is a hardened-stealth fork of playwright. We REQUIRE it - falling
+# back to vanilla playwright silently makes the script useless against
+# Cloudflare's bot detection. Fail loud instead.
 try:
-    from patchright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-    USING_PATCHRIGHT = True
+    from patchright.sync_api import (
+        sync_playwright as _pr_sync_playwright,
+        TimeoutError as PlaywrightTimeoutError,
+    )
+except ImportError as _e:
+    sys.stderr.write(
+        "\n[FATAL] 'patchright' is not installed.\n"
+        "Install it with:\n"
+        "    pip install -r requirements.txt\n"
+        "    patchright install chrome\n\n"
+        "Running vanilla playwright will be instantly detected by Cloudflare.\n"
+    )
+    raise
+
+# camoufox is an optional alternative engine - a Firefox build with C++-level
+# fingerprint injection. Currently considered the strongest open-source option
+# against Cloudflare Bot Management.
+try:
+    from camoufox.sync_api import Camoufox as _Camoufox
+    HAS_CAMOUFOX = True
 except ImportError:
-    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-    USING_PATCHRIGHT = False
+    HAS_CAMOUFOX = False
 
 
 # ---------- credential generation ----------------------------------------------
@@ -408,6 +428,164 @@ def process_registration(page, url, max_captcha_retries=3, debug_dir=None):
     return None
 
 
+# ---------- engine launchers ---------------------------------------------------
+def _parse_proxy(proxy_url):
+    """
+    Convert a proxy URL like 'http://user:pass@host:port' into Playwright's
+    proxy dict {server, username, password}.
+    """
+    if not proxy_url:
+        return None
+    from urllib.parse import urlparse
+    u = urlparse(proxy_url)
+    if not u.scheme or not u.hostname:
+        logger.error(f"Invalid proxy URL: {proxy_url}")
+        return None
+    server = f"{u.scheme}://{u.hostname}"
+    if u.port:
+        server += f":{u.port}"
+    out = {"server": server}
+    if u.username:
+        out["username"] = u.username
+    if u.password:
+        out["password"] = u.password
+    return out
+
+
+def _warn_if_datacenter_ip():
+    """
+    Best-effort detection of well-known cloud/datacenter IP ranges.
+    Cloudflare assigns very low trust to Azure/AWS/GCP egress IPs - even a
+    perfect fingerprint may still be blocked.
+    """
+    try:
+        import urllib.request
+        import json
+        with urllib.request.urlopen("https://ipinfo.io/json", timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        ip   = data.get("ip", "?")
+        org  = (data.get("org") or "").lower()
+        host = (data.get("hostname") or "").lower()
+        flag_keywords = ("microsoft", "azure", "amazon", "aws", "google",
+                         "gcp", "digitalocean", "linode", "ovh", "hetzner",
+                         "vultr", "oracle")
+        is_dc = any(k in org for k in flag_keywords) or \
+                any(k in host for k in flag_keywords)
+        if is_dc:
+            logger.warning("=" * 64)
+            logger.warning(f"DATACENTER IP DETECTED: {ip}  ({data.get('org')})")
+            logger.warning("Cloudflare assigns near-zero trust to datacenter IPs.")
+            logger.warning("Even a perfect browser fingerprint may be blocked.")
+            logger.warning("Strongly recommended: pass --proxy http://user:pass@host:port")
+            logger.warning("using a *residential* proxy (Bright Data, IPRoyal, etc.).")
+            logger.warning("=" * 64)
+        else:
+            logger.info(f"egress IP looks residential/clean: {ip} ({data.get('org')})")
+    except Exception as e:
+        logger.debug(f"IP-trust pre-flight check failed (non-fatal): {e}")
+
+
+def _run_with_patchright(args, urls, debug_dir, results):
+    """Patchright (Chrome + stealth patches) launcher."""
+    # CRITICAL: with channel="chrome" we MUST NOT override user_agent / viewport /
+    # timezone_id / locale, because real Chrome already has perfectly consistent
+    # values for all of those. Overriding even one creates a mismatch between
+    # the JS-reported value and the build/OS/binary, which Cloudflare's worker
+    # cross-checks. Let Chrome be itself.
+    launch_kwargs = dict(
+        user_data_dir=args.profile,
+        headless=args.headless,
+        no_viewport=True,
+        viewport=None,
+        ignore_default_args=["--enable-automation"],
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--no-default-browser-check",
+            "--no-first-run",
+        ],
+    )
+    if args.channel and args.channel != "chromium":
+        launch_kwargs["channel"] = args.channel
+
+    proxy = _parse_proxy(args.proxy)
+    if proxy:
+        launch_kwargs["proxy"] = proxy
+
+    with _pr_sync_playwright() as p:
+        try:
+            context = p.chromium.launch_persistent_context(**launch_kwargs)
+        except Exception as e:
+            logger.warning(f"channel='{args.channel}' failed ({e}); "
+                           f"falling back to bundled chromium.")
+            launch_kwargs.pop("channel", None)
+            context = p.chromium.launch_persistent_context(**launch_kwargs)
+
+        for url in urls:
+            for i in range(args.count):
+                if args.count > 1:
+                    logger.info(f"=== {url} attempt {i + 1}/{args.count} ===")
+                page = context.new_page()
+                try:
+                    result = process_registration(page, url, debug_dir=debug_dir)
+                    if result:
+                        results.append(result)
+                except Exception as e:
+                    logger.error(f"Critical error on {url}: {e}")
+                finally:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+                # Human-like pause between registrations
+                if args.count > 1 and i < args.count - 1:
+                    time.sleep(random.uniform(4.0, 8.0))
+
+        context.close()
+
+
+def _run_with_camoufox(args, urls, debug_dir, results):
+    """Camoufox (Firefox + C++ fingerprint injection) launcher."""
+    if not HAS_CAMOUFOX:
+        logger.error("--engine=camoufox requested but 'camoufox' is not installed.")
+        logger.error("Install with:  pip install camoufox[geoip]  &&  camoufox fetch")
+        sys.exit(1)
+
+    proxy = _parse_proxy(args.proxy)
+    cf_kwargs = dict(
+        headless=args.headless,
+        humanize=True,           # human-like cursor movement
+        os=("windows", "macos"), # rotate among realistic OS fingerprints
+        persistent_context=True,
+        user_data_dir=args.profile,
+    )
+    if proxy:
+        cf_kwargs["proxy"] = proxy
+        cf_kwargs["geoip"] = True    # auto-match locale/timezone to proxy IP
+
+    with _Camoufox(**cf_kwargs) as browser:
+        # When persistent_context=True, the context lives on `browser` directly.
+        context = browser
+        for url in urls:
+            for i in range(args.count):
+                if args.count > 1:
+                    logger.info(f"=== {url} attempt {i + 1}/{args.count} ===")
+                page = context.new_page()
+                try:
+                    result = process_registration(page, url, debug_dir=debug_dir)
+                    if result:
+                        results.append(result)
+                except Exception as e:
+                    logger.error(f"Critical error on {url}: {e}")
+                finally:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+                if args.count > 1 and i < args.count - 1:
+                    time.sleep(random.uniform(4.0, 8.0))
+
+
 # ---------- main ---------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description="Automate Styx Market registration.")
@@ -419,8 +597,9 @@ def main():
     parser.add_argument("--channel",  default="chrome",
                         help="Browser channel: 'chrome' (recommended), "
                              "'chrome-beta', 'msedge' or 'chromium'.")
-    parser.add_argument("--profile",  default="/tmp/styx_profile",
-                        help="Persistent user-data dir (keeps cookies between runs).")
+    parser.add_argument("--profile",  default=os.path.join(tempfile.gettempdir(), "styx_profile"),
+                        help="Persistent user-data dir (keeps cookies between runs). "
+                             "Defaults to OS temp dir for cross-platform support.")
     parser.add_argument("--fresh-profile", action="store_true",
                         help="Wipe the profile dir before starting (use if CF "
                              "has already flagged a previous session).")
@@ -430,6 +609,19 @@ def main():
                              "manually. WARNING: close your Chrome before running.")
     parser.add_argument("--debug",    action="store_true",
                         help="Save screenshots + HTML dumps to ./debug_out/")
+    parser.add_argument("--proxy",    default=os.environ.get("STYX_PROXY"),
+                        help="Proxy URL, e.g. http://user:pass@host:port or "
+                             "socks5://host:port. Strongly recommended on "
+                             "datacenter IPs (Azure/AWS/GCP). Can also be set "
+                             "via the STYX_PROXY env var.")
+    parser.add_argument("--engine",   default="patchright",
+                        choices=["patchright", "camoufox"],
+                        help="Browser engine. 'patchright' = Chrome with stealth "
+                             "patches (default, fast). 'camoufox' = Firefox with "
+                             "C++-level fingerprint injection (slower but the "
+                             "strongest open-source Cloudflare bypass).")
+    parser.add_argument("--count",    type=int, default=1,
+                        help="How many accounts to register per URL.")
     args = parser.parse_args()
 
     # Auto-detect real Chrome profile path if requested
@@ -464,8 +656,20 @@ def main():
         os.makedirs(debug_dir, exist_ok=True)
         logger.info(f"Debug artifacts -> {debug_dir}")
 
-    logger.info(f"patchright in use: {USING_PATCHRIGHT}")
-    logger.info(f"channel={args.channel}  headless={args.headless}  profile={args.profile}")
+    logger.info(f"engine={args.engine}  channel={args.channel}  "
+                f"headless={args.headless}  profile={args.profile}")
+    if args.proxy:
+        # Mask password in logs.
+        masked = args.proxy
+        if "@" in masked and "://" in masked:
+            scheme, rest = masked.split("://", 1)
+            creds, host = rest.rsplit("@", 1)
+            user_part = creds.split(":", 1)[0]
+            masked = f"{scheme}://{user_part}:***@{host}"
+        logger.info(f"proxy={masked}")
+    else:
+        # Pre-flight: warn loudly if running on a datacenter IP (Azure/AWS/GCP).
+        _warn_if_datacenter_ip()
 
     # Optionally wipe the profile (if a previous run got CF-flagged, its
     # fingerprint cookies will still be there and re-flag us instantly).
@@ -475,56 +679,10 @@ def main():
         shutil.rmtree(args.profile, ignore_errors=True)
 
     results = []
-    with sync_playwright() as p:
-        # launch_persistent_context is critical: it uses an on-disk profile that
-        # accumulates legitimate cookies/storage across runs — far less detectable
-        # than a fresh ephemeral context every time.
-        #
-        # CRITICAL: with channel="chrome" we MUST NOT override user_agent / viewport /
-        # timezone_id / locale, because real Chrome already has perfectly consistent
-        # values for all of those. Overriding even one creates a mismatch between
-        # the JS-reported value and the build/OS/binary, which Cloudflare's worker
-        # cross-checks. Let Chrome be itself.
-        launch_kwargs = dict(
-            user_data_dir=args.profile,
-            headless=args.headless,
-            no_viewport=True,
-            viewport=None,
-            # Strip the automation flag that Chrome adds by default — this is what
-            # makes window.navigator.webdriver === true and triggers CF's bot rules.
-            ignore_default_args=["--enable-automation"],
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-features=IsolateOrigins,site-per-process",
-                "--no-default-browser-check",
-                "--no-first-run",
-            ],
-        )
-        # Channel selection — 'chrome' uses the real installed Chrome, which
-        # is much harder to fingerprint than playwright's bundled chromium.
-        if args.channel and args.channel != "chromium":
-            launch_kwargs["channel"] = args.channel
-
-        try:
-            context = p.chromium.launch_persistent_context(**launch_kwargs)
-        except Exception as e:
-            logger.warning(f"channel='{args.channel}' failed ({e}); "
-                           f"falling back to bundled chromium.")
-            launch_kwargs.pop("channel", None)
-            context = p.chromium.launch_persistent_context(**launch_kwargs)
-
-        for url in urls:
-            page = context.new_page()
-            try:
-                result = process_registration(page, url, debug_dir=debug_dir)
-                if result:
-                    results.append(result)
-            except Exception as e:
-                logger.error(f"Critical error on {url}: {e}")
-            finally:
-                page.close()
-
-        context.close()
+    if args.engine == "camoufox":
+        _run_with_camoufox(args, urls, debug_dir, results)
+    else:
+        _run_with_patchright(args, urls, debug_dir, results)
 
     if results:
         new_file = not os.path.isfile(args.output)
