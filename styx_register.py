@@ -437,28 +437,45 @@ def do_topup(page, amount, currency_label="BNB (BEP20)",
     clicked = False
     click_info = None
 
-    # Primary strategy: JS-based. Find the leaf element whose text matches
-    # EXACTLY (trimmed), walk up to the first clickable ancestor (button, a,
-    # role=button, onclick, or cursor:pointer), scroll into view, dispatch a
-    # real MouseEvent. This handles the common case where the tile is a div
-    # wrapping an <img> icon + a <span> label, and only the wrapper has the
-    # click handler.
+    # Primary strategy: target Styx's known DOM structure directly.
+    # Each tile is:
+    #   <... class="wallet-currency-toggler ...">
+    #     <div class="wallet-currency-toggler__title wct-with-icon">
+    #       <span class="wct-coin-icon"><svg/></span>
+    #       <span class="wct-coin-name">BNB (BEP20)</span>
+    #     </div>
+    #   </...>
+    # We find the .wct-coin-name with matching text, walk up to the nearest
+    # ancestor whose class contains 'toggler' (the actual clickable tile),
+    # scroll into view, and dispatch a full mouse event sequence.
     try:
         click_info = page.evaluate(
             """(label) => {
                 const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
                 const want = norm(label);
-                // Collect leaf-ish elements whose own text matches exactly.
-                const all = Array.from(document.querySelectorAll('div, span, button, a, p, label, li'));
-                const exact = all.filter(el => {
-                    const own = norm(Array.from(el.childNodes)
-                        .filter(n => n.nodeType === 3)
-                        .map(n => n.textContent).join(''));
-                    if (own === want) return true;
-                    return norm(el.textContent) === want && el.children.length <= 2;
-                });
-                if (exact.length === 0) return { ok: false, reason: 'no text match' };
 
+                // 1) Styx-specific: find by .wct-coin-name
+                const nameEls = Array.from(document.querySelectorAll('.wct-coin-name'));
+                let matched = nameEls.find(el => norm(el.textContent) === want);
+
+                // 2) Fallback: any leaf-ish element whose own text matches exactly
+                if (!matched) {
+                    const all = Array.from(document.querySelectorAll('div, span, button, a, p, label, li'));
+                    matched = all.find(el => {
+                        const own = norm(Array.from(el.childNodes)
+                            .filter(n => n.nodeType === 3)
+                            .map(n => n.textContent).join(''));
+                        return own === want;
+                    });
+                }
+                if (!matched) return { ok: false, reason: 'no text match' };
+
+                // Walk up: prefer ancestors whose className contains 'toggler'
+                // (Styx-specific), then anything clickable (button/a/role/cursor:pointer).
+                const isStyxTile = (el) => {
+                    if (!el || !el.className || !el.className.toString) return false;
+                    return /wallet-currency-toggler(?!__)/i.test(el.className.toString());
+                };
                 const isClickable = (el) => {
                     if (!el || !el.tagName) return false;
                     const t = el.tagName.toLowerCase();
@@ -466,63 +483,69 @@ def do_topup(page, amount, currency_label="BNB (BEP20)",
                     const role = el.getAttribute && el.getAttribute('role');
                     if (role === 'button' || role === 'link' || role === 'tab') return true;
                     if (el.onclick != null) return true;
-                    try {
-                        if (getComputedStyle(el).cursor === 'pointer') return true;
-                    } catch (e) {}
+                    try { if (getComputedStyle(el).cursor === 'pointer') return true; } catch (e) {}
                     return false;
                 };
 
-                for (const m of exact) {
-                    let cur = m;
+                let target = null;
+                let cur = matched;
+                // Pass 1: find a Styx tile ancestor.
+                for (let i = 0; i < 10 && cur; i++) {
+                    if (isStyxTile(cur)) { target = cur; break; }
+                    cur = cur.parentElement;
+                }
+                // Pass 2: fall back to any clickable ancestor.
+                if (!target) {
+                    cur = matched;
                     for (let i = 0; i < 10 && cur; i++) {
-                        if (isClickable(cur)) {
-                            try { cur.scrollIntoView({block: 'center'}); } catch (e) {}
-                            // Dispatch a full mouse sequence so frameworks listening
-                            // for mousedown/mouseup also see it.
-                            const rect = cur.getBoundingClientRect();
-                            const x = rect.left + rect.width / 2;
-                            const y = rect.top + rect.height / 2;
-                            for (const type of ['mouseover','mousedown','mouseup','click']) {
-                                cur.dispatchEvent(new MouseEvent(type, {
-                                    bubbles: true, cancelable: true,
-                                    clientX: x, clientY: y, button: 0,
-                                }));
-                            }
-                            return {
-                                ok: true,
-                                tag: cur.tagName,
-                                cls: cur.className,
-                                text: norm(cur.textContent).slice(0, 80),
-                            };
-                        }
+                        if (isClickable(cur)) { target = cur; break; }
                         cur = cur.parentElement;
                     }
                 }
-                return { ok: false, reason: 'no clickable ancestor' };
+                if (!target) return { ok: false, reason: 'no clickable ancestor', text: norm(matched.textContent) };
+
+                try { target.scrollIntoView({block: 'center'}); } catch (e) {}
+                const rect = target.getBoundingClientRect();
+                const x = rect.left + rect.width / 2;
+                const y = rect.top + rect.height / 2;
+                for (const type of ['mouseover','mouseenter','mousedown','mouseup','click']) {
+                    target.dispatchEvent(new MouseEvent(type, {
+                        bubbles: true, cancelable: true,
+                        clientX: x, clientY: y, button: 0, view: window,
+                    }));
+                }
+                return {
+                    ok: true,
+                    tag: target.tagName,
+                    cls: (target.className && target.className.toString)
+                            ? target.className.toString() : '',
+                    text: norm(target.textContent).slice(0, 80),
+                };
             }""",
             currency_label,
         )
         if click_info and click_info.get("ok"):
             clicked = True
             logger.info(f"  -> JS click on '{currency_label}': {click_info}")
+        else:
+            logger.debug(f"  JS click returned: {click_info}")
     except Exception as e:
         logger.debug(f"  JS-based tile click failed: {e}")
 
     # Fallback strategies (only if the JS approach failed)
     if not clicked:
         strategies = [
+            ("styx toggler by name",
+             lambda: page.locator(
+                 ".wallet-currency-toggler",
+                 has=page.locator(f".wct-coin-name >> text='{currency_label}'"),
+             ).first.click(timeout=4000)),
             ("role=button exact",
              lambda: page.get_by_role("button", name=currency_label, exact=True)
                           .first.click(timeout=4000)),
             ("text exact",
              lambda: page.get_by_text(currency_label, exact=True).first
                           .click(timeout=4000)),
-            ("button:has-text",
-             lambda: page.locator(f"button:has-text('{currency_label}')")
-                          .first.click(timeout=4000)),
-            ("[class*=currency]:has-text",
-             lambda: page.locator(f"[class*='currency']:has-text('{currency_label}')")
-                          .first.click(timeout=4000)),
         ]
         for name, strat in strategies:
             try:
@@ -545,57 +568,59 @@ def do_topup(page, amount, currency_label="BNB (BEP20)",
         page.screenshot(path=os.path.join(debug_dir, "12_topup_tile_selected.png"),
                         full_page=True)
 
-    # 1b) VERIFY the right tile is actually selected. The selected tile
-    # typically gets an active/selected/checked class or an ARIA attr.
-    try:
-        sel_info = page.evaluate(
-            """(label) => {
-                const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
-                const want = norm(label);
-                // Find candidate tiles (anything containing exactly our label)
-                const tiles = Array.from(document.querySelectorAll('*'))
-                    .filter(el => norm(el.textContent) === want && el.children.length <= 5);
-                let selectedNear = false;
-                let nearestSelectedText = null;
-                // What does "selected" look like? Walk up from our tile and check
-                // if any ancestor has a selected/active/checked class or attr.
-                const looksSelected = (el) => {
-                    const cls = (el.className && el.className.toString) ?
-                                el.className.toString() : '';
-                    if (/active|selected|checked|chosen|current/i.test(cls)) return true;
-                    const aria = el.getAttribute && el.getAttribute('aria-selected');
-                    if (aria === 'true') return true;
-                    const pressed = el.getAttribute && el.getAttribute('aria-pressed');
-                    if (pressed === 'true') return true;
-                    return false;
-                };
-                for (const t of tiles) {
-                    let cur = t;
-                    for (let i = 0; i < 6 && cur; i++) {
-                        if (looksSelected(cur)) { selectedNear = true; break; }
+    # 1b) VERIFY the right tile is actually selected, and RETRY if not.
+    def _is_selected():
+        try:
+            return page.evaluate(
+                """(label) => {
+                    const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+                    const want = norm(label);
+                    const nameEls = Array.from(document.querySelectorAll('.wct-coin-name'));
+                    const target = nameEls.find(el => norm(el.textContent) === want);
+                    if (!target) return { ok: false, reason: 'tile not in DOM' };
+
+                    // Walk up to the toggler and inspect its classes / state.
+                    let cur = target;
+                    for (let i = 0; i < 8 && cur; i++) {
+                        const cls = (cur.className && cur.className.toString)
+                                       ? cur.className.toString() : '';
+                        if (/wallet-currency-toggler(?!__)/i.test(cls)) {
+                            const selected = /active|selected|checked|chosen|current|--is-/i.test(cls)
+                                || cur.getAttribute('aria-selected') === 'true'
+                                || cur.getAttribute('aria-pressed') === 'true';
+                            return { ok: true, selected: selected, cls: cls };
+                        }
                         cur = cur.parentElement;
                     }
-                    if (selectedNear) break;
-                }
-                // Also find what IS currently selected (for diagnostics).
-                const anySelected = Array.from(document.querySelectorAll(
-                    "[class*='active'], [class*='selected'], [class*='checked'], "
-                    + "[aria-selected='true'], [aria-pressed='true']"
-                )).map(el => norm(el.textContent)).filter(t => t && t.length < 60);
-                return {
-                    matched: tiles.length,
-                    selectedNear: selectedNear,
-                    nearby: anySelected.slice(0, 6),
-                };
-            }""",
-            currency_label,
-        )
-        logger.info(f"  selection check: {sel_info}")
-        if not sel_info.get("selectedNear"):
-            logger.warning(f"'{currency_label}' may NOT be selected. "
-                           f"Current selection candidates: {sel_info.get('nearby')}")
-    except Exception as e:
-        logger.debug(f"selection verification failed: {e}")
+                    return { ok: false, reason: 'no toggler ancestor' };
+                }""",
+                currency_label,
+            )
+        except Exception as e:
+            logger.debug(f"selection check failed: {e}")
+            return None
+
+    sel = _is_selected()
+    logger.info(f"  selection check: {sel}")
+    if sel and sel.get("ok") and not sel.get("selected"):
+        logger.warning(f"'{currency_label}' click didn't latch - retrying once via direct Playwright click.")
+        try:
+            page.locator(
+                ".wallet-currency-toggler",
+                has=page.locator(".wct-coin-name", has_text=currency_label),
+            ).first.click(timeout=4000)
+            time.sleep(random.uniform(0.6, 1.0))
+            sel = _is_selected()
+            logger.info(f"  selection check (retry): {sel}")
+        except Exception as e:
+            logger.warning(f"retry click failed: {e}")
+    if sel and sel.get("ok") and not sel.get("selected"):
+        logger.error(f"'{currency_label}' still not selected after retry. "
+                     f"Aborting top-up to avoid sending the wrong currency.")
+        if debug_dir:
+            page.screenshot(path=os.path.join(debug_dir, "12b_topup_wrong_tile.png"),
+                            full_page=True)
+        return False
 
     # 2) Fill the Payment Amount input
     logger.info(f"Entering payment amount: {amount}")
