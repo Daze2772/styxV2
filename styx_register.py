@@ -119,8 +119,8 @@ def process_registration(page, url, max_captcha_retries=3):
 
     # 2. Registration Form
     logger.info("Waiting for Registration form to load...")
-    # Wait for the registration form container to be present
-    page.wait_for_selector("div.sign-up-form__body, div.sign-up__form", timeout=15000)
+    # Wait for the exact password field using the user's provided class/name
+    page.wait_for_selector("input[name='password']", state="attached", timeout=15000)
     
     username = f"user_{generate_random_string(8)}"
     password = generate_password()
@@ -129,24 +129,23 @@ def process_registration(page, url, max_captcha_retries=3):
     logger.info(f"Generated - User: {username}")
     
     try:
-        logger.info("Attempting forced fill with global locators...")
-        # Mobile/hidden navbars often have the same inputs. The sign-up ones are usually the LAST in the DOM.
-        page.locator("input[name='username']").last.fill(username, force=True, timeout=5000)
-        page.locator("input[name='password']").last.fill(password, force=True, timeout=5000)
+        # Use exact name locators with .first (as .last was matching detached/hidden elements)
+        page.locator("input[name='username']").first.fill(username, force=True, timeout=5000)
+        page.locator("input[name='password']").first.fill(password, force=True, timeout=5000)
         
         # Determine secret code input
         secret_locator = page.locator("input[name='secret_code'], input[name='secret'], input[name='pin']")
         if secret_locator.count() > 0:
-            secret_locator.last.fill(secret, force=True, timeout=5000)
+            secret_locator.first.fill(secret, force=True, timeout=5000)
         else:
-            # Fallback to the last password input on the page
-            page.locator("input[type='password']").last.fill(secret, force=True, timeout=5000)
+            # Fallback to the third .input__input field
+            page.locator("input.input__input").nth(2).fill(secret, force=True, timeout=5000)
             
+        page.locator("button:has-text('Sign up'), button[type='submit'], .sign-up__form button").first.click(force=True, timeout=5000)
+        logger.info("Submitted Registration Form.")
     except Exception as e:
-        logger.warning(f"Fill failed. Error: {e}")
-        
-    page.locator("button:has-text('Sign up'), button[type='submit'], .sign-up__form button").last.click(force=True, timeout=5000)
-    logger.info("Submitted Registration Form.")
+        logger.error(f"Failed to fill and submit the form: {e}")
+        return None
 
     # 3. Time Verification / Clock CAPTCHA
     success = False
@@ -183,9 +182,14 @@ def process_registration(page, url, max_captcha_retries=3):
                 break
                 
         except PlaywrightTimeoutError:
-            # If the modal doesn't appear, the registration might have succeeded without CAPTCHA
-            logger.info("No CAPTCHA modal detected or it disappeared quickly.")
-            success = True
+            # Check if there are form validation errors preventing the CAPTCHA from showing
+            error_msg = page.locator("text=This field is required, text=Error, .error-message, .invalid-feedback").first
+            if error_msg.is_visible():
+                logger.error(f"Form validation errors found: {error_msg.inner_text()}")
+                success = False
+            else:
+                logger.info("No CAPTCHA modal detected. Assuming success or site didn't prompt.")
+                success = True
             break
         except Exception as e:
             logger.error(f"Error solving CAPTCHA: {str(e)}")
