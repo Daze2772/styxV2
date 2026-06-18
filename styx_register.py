@@ -120,7 +120,7 @@ def process_registration(page, url, max_captcha_retries=3):
     # 2. Registration Form
     logger.info("Waiting for Registration form to load...")
     # Wait for the username field to be present
-    page.wait_for_selector("input[placeholder*='Username'], input[name='username']", timeout=15000)
+    page.wait_for_selector("input[name='username']:visible", timeout=15000)
     
     username = f"user_{generate_random_string(8)}"
     password = generate_password()
@@ -128,11 +128,18 @@ def process_registration(page, url, max_captcha_retries=3):
     
     logger.info(f"Generated - User: {username}")
     
-    page.locator("input[placeholder*='Username'], input[name='username']").fill(username)
-    page.locator("input[placeholder*='Password'], input[name='password']").fill(password)
-    page.locator("input[placeholder*='Secret'], input[name='secret_code']").fill(secret)
+    page.locator("input[name='username']:visible").first.fill(username)
+    page.locator("input[name='password']:visible").first.fill(password)
     
-    page.locator("button:has-text('Sign up'), input[value='Sign up'], button[type='submit']").click()
+    # Try different possible names for the secret code field, or fallback to the 3rd input in the form
+    secret_locator = page.locator("input[name='secret_code']:visible, input[name='secret']:visible, input[name='pin']:visible")
+    if secret_locator.count() > 0:
+        secret_locator.first.fill(secret)
+    else:
+        # Fallback to the 3rd input field in the sign up form body
+        page.locator("div.sign-up-form__body input").nth(2).fill(secret)
+    
+    page.locator("button:has-text('Sign up'):visible, button[type='submit']:visible, form button:visible").first.click()
     logger.info("Submitted Registration Form.")
 
     # 3. Time Verification / Clock CAPTCHA
