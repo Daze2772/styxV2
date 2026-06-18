@@ -75,55 +75,199 @@ def generate_password(length=14):
 
 
 # ---------- clock CAPTCHA solver -----------------------------------------------
-def solve_clock(image_path):
+def _detect_dial(gray):
+    """
+    Locate the white clock dial inside the larger CAPTCHA image and return
+    (cx, cy, r). Falls back to the image center if Hough fails.
+    """
+    h, w = gray.shape
+    blurred = cv2.medianBlur(gray, 5)
+    circles = cv2.HoughCircles(
+        blurred, cv2.HOUGH_GRADIENT, dp=1.2,
+        minDist=min(h, w),
+        param1=80, param2=30,
+        minRadius=int(min(h, w) * 0.20),
+        maxRadius=int(min(h, w) * 0.55),
+    )
+    if circles is not None:
+        x, y, r = circles[0][0]
+        return int(x), int(y), int(r)
+    return w // 2, h // 2, int(min(h, w) * 0.45)
+
+
+def _angle_from_12(dx, dy):
+    """
+    Clock-face angle in degrees [0, 360) where 0 = 12 o'clock position,
+    increasing clockwise. dy points down in image coords.
+    """
+    # atan2(dx, -dy):  dx>0,dy<0 (up-right) => positive small => OK.
+    deg = math.degrees(math.atan2(dx, -dy))
+    return deg % 360
+
+
+def solve_clock(image_path, debug_dir=None):
+    """
+    Robust analog-clock reader for the Styx CAPTCHA.
+
+    Algorithm:
+      1. Find the actual dial (Hough circle).
+      2. Mask everything outside ~0.92*radius (drops the bezel ticks & numbers).
+      3. Threshold (Otsu) to isolate dark hands on white dial.
+      4. Find connected components touching the center (real hands always do).
+      5. For each hand component, find its farthest point from center
+         (= tip), measure its length, and compute its clock angle.
+      6. Sort by length: longest = minute hand, shorter = hour hand.
+      7. Translate angles -> hh:mm with proper hour-hand correction
+         (a real hour hand advances 0.5deg per minute, so we use
+          the *minute* reading to refine which hour we're closest to).
+    """
     img = cv2.imread(image_path)
     if img is None:
         logger.warning(f"Could not read clock image at {image_path}")
         return "12:00"
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY_INV)
-    h, w = thresh.shape
-    cx, cy = w // 2, h // 2
+    h, w = gray.shape
 
-    lines = cv2.HoughLinesP(thresh, rho=1, theta=np.pi / 180,
-                            threshold=30, minLineLength=20, maxLineGap=5)
-    if lines is None:
+    # 1) locate the dial
+    cx, cy, r = _detect_dial(gray)
+    logger.debug(f"clock dial @ ({cx},{cy}) r={r}")
+
+    # 2) mask outside the dial (drop tick marks + numbers)
+    mask = np.zeros_like(gray)
+    cv2.circle(mask, (cx, cy), int(r * 0.92), 255, -1)
+    dial = cv2.bitwise_and(gray, gray, mask=mask)
+    # Pixels outside the mask become 0 (black). Push them to white so they
+    # don't get picked up as "hand" during thresholding.
+    dial[mask == 0] = 255
+
+    # 3) threshold: hands are dark on a bright dial -> invert.
+    _, hands_bin = cv2.threshold(
+        dial, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
+    )
+    # Light cleanup only - we MUST NOT close the gap between the two hands.
+    kernel = np.ones((3, 3), np.uint8)
+    hands_bin = cv2.morphologyEx(hands_bin, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    # 3b) Punch a hole at the hub. This separates the two hands (which
+    # otherwise meet at the center pivot) into two distinct components.
+    hub_radius = max(8, int(r * 0.10))
+    cv2.circle(hands_bin, (cx, cy), hub_radius, 0, -1)
+
+    # 4) connected components - a real hand has its CLOSEST pixel near the hub
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(hands_bin, connectivity=8)
+    candidates = []
+    for i in range(1, num):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area < 25:
+            continue
+        ys, xs = np.where(labels == i)
+        dists = np.hypot(xs - cx, ys - cy)
+        min_d = float(dists.min())
+        max_d = float(dists.max())
+        # The closest pixel of a hand to the center sits right at the
+        # hub-mask boundary (~r*0.10). Numbers/ticks are far from center.
+        if min_d > r * 0.22:
+            continue
+        # Must extend out far enough to be a real hand.
+        if max_d < r * 0.30:
+            continue
+        idx_tip = int(np.argmax(dists))
+        tip_x, tip_y = int(xs[idx_tip]), int(ys[idx_tip])
+        candidates.append({
+            "label": int(i),
+            "length": max_d,
+            "tip": (tip_x, tip_y),
+            "angle": _angle_from_12(tip_x - cx, tip_y - cy),
+            "pixels": area,
+        })
+
+    if not candidates:
+        logger.warning("solve_clock: no qualifying hands found.")
         return "12:00"
 
-    hands = []
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
-        dist = abs((y2 - y1) * cx - (x2 - x1) * cy + x2 * y1 - y2 * x1) \
-               / (math.hypot(y2 - y1, x2 - x1) + 1e-5)
-        if dist < min(w, h) * 0.15:
-            d1 = math.hypot(x1 - cx, y1 - cy)
-            d2 = math.hypot(x2 - cx, y2 - cy)
-            far_x, far_y = (x1, y1) if d1 > d2 else (x2, y2)
-            hands.append({'length': max(d1, d2), 'x': far_x, 'y': far_y})
+    # 5) If two hands overlap visually they become 1 component - split via Hough.
+    if len(candidates) == 1:
+        logger.debug("solve_clock: only 1 hand component - attempting Hough split.")
+        lines = cv2.HoughLinesP(
+            hands_bin, rho=1, theta=np.pi / 180,
+            threshold=20, minLineLength=int(r * 0.30), maxLineGap=6,
+        )
+        if lines is not None:
+            clusters = {}
+            for ln in lines:
+                x1, y1, x2, y2 = ln[0]
+                d1 = math.hypot(x1 - cx, y1 - cy)
+                d2 = math.hypot(x2 - cx, y2 - cy)
+                near = min(d1, d2)
+                if near > r * 0.30:
+                    continue
+                if d1 > d2:
+                    tx, ty, tl = x1, y1, d1
+                else:
+                    tx, ty, tl = x2, y2, d2
+                ang = _angle_from_12(tx - cx, ty - cy)
+                key = int(ang // 12)            # 12-deg buckets
+                if key not in clusters or tl > clusters[key]["length"]:
+                    clusters[key] = {"length": tl, "tip": (tx, ty), "angle": ang}
+            if len(clusters) >= 2:
+                candidates = sorted(clusters.values(),
+                                    key=lambda x: x["length"], reverse=True)[:2]
 
-    if not hands:
-        return "12:00"
+    # 6) sort: longest is the minute hand
+    candidates.sort(key=lambda x: x["length"], reverse=True)
+    minute_hand = candidates[0]
+    hour_hand = candidates[1] if len(candidates) > 1 else candidates[0]
 
-    hands.sort(key=lambda h: h['length'], reverse=True)
-    min_hand = hands[0]
-    hour_hand = None
-    for hand in hands[1:]:
-        a1 = math.atan2(min_hand['y'] - cy, min_hand['x'] - cx)
-        a2 = math.atan2(hand['y'] - cy, hand['x'] - cx)
-        if abs(a1 - a2) > 0.2:
-            hour_hand = hand
-            break
-    if not hour_hand:
-        hour_hand = min_hand
+    logger.debug(f"minute hand: len={minute_hand['length']:.1f} "
+                 f"angle={minute_hand['angle']:.1f}")
+    logger.debug(f"hour hand:   len={hour_hand['length']:.1f} "
+                 f"angle={hour_hand['angle']:.1f}")
 
-    def get_angle(x, y):
-        return (math.degrees(math.atan2(y - cy, x - cx)) + 90) % 360
-
-    minute = int(round((get_angle(min_hand['x'], min_hand['y']) / 360.0) * 60)) % 60
-    hour   = int(round((get_angle(hour_hand['x'], hour_hand['y']) / 360.0) * 12)) % 12
+    # 7) angles -> time
+    minute = int(round(minute_hand["angle"] / 6.0)) % 60   # 6 deg per minute
+    # The hour hand advances 0.5deg per minute, so we expect:
+    #   hour_angle == integer_hour*30 + minute*0.5
+    # Pick the integer_hour [0..11] that best fits the observed minute.
+    expected_offset = minute / 60.0
+    best_diff = 9999
+    best_hour = 0
+    for h_int in range(12):
+        expected_angle = (h_int + expected_offset) * 30.0
+        diff = abs((hour_hand["angle"] - expected_angle + 180) % 360 - 180)
+        if diff < best_diff:
+            best_diff = diff
+            best_hour = h_int
+    hour = best_hour
     if hour == 0:
         hour = 12
+
+    naive_hour = int(round(hour_hand["angle"] / 30.0)) % 12
+    if naive_hour == 0:
+        naive_hour = 12
+
+    logger.info(f"solve_clock -> hour={hour} (naive={naive_hour})  minute={minute}")
+
+    # Optional debug overlay
+    if debug_dir:
+        try:
+            overlay = img.copy()
+            cv2.circle(overlay, (cx, cy), r, (0, 255, 255), 1)
+            for hand, color in ((minute_hand, (0, 255, 0)), (hour_hand, (0, 0, 255))):
+                cv2.line(overlay, (cx, cy), hand["tip"], color, 2)
+                cv2.circle(overlay, hand["tip"], 4, color, -1)
+            cv2.putText(overlay, f"{hour:02d}:{minute:02d}",
+                        (10, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                        (255, 255, 255), 2)
+            out_path = os.path.join(
+                debug_dir,
+                f"clock_solved_{os.path.basename(image_path)}",
+            )
+            cv2.imwrite(out_path, overlay)
+            logger.debug(f"debug overlay -> {out_path}")
+        except Exception as e:
+            logger.debug(f"debug overlay failed: {e}")
+
     return f"{hour:02d}:{minute:02d}"
 
 
@@ -371,60 +515,160 @@ def process_registration(page, url, max_captcha_retries=3, debug_dir=None):
         return None
 
     # 4) Clock CAPTCHA --------------------------------------------------------
+    # The modal animates in - give it a beat.
+    time.sleep(1.5)
+
+    # Wait for ANY reliable CAPTCHA indicator: a 00:00-placeholder input,
+    # an "OK" button, or the prompt text. Whichever appears first wins.
+    captcha_present = False
+    try:
+        page.wait_for_function(
+            """() => {
+                const hasInput = !!document.querySelector(
+                    "input[placeholder='00:00'], input[placeholder*=':']");
+                const hasOK = Array.from(document.querySelectorAll('button'))
+                    .some(b => /^\\s*OK\\s*$/i.test(b.textContent || ''));
+                const txt = document.body.innerText || '';
+                const hasTxt = /not a robot/i.test(txt)
+                            || /time shown in the picture/i.test(txt);
+                return hasInput || hasOK || hasTxt;
+            }""",
+            timeout=30000,
+        )
+        captcha_present = True
+        logger.info("CAPTCHA modal detected.")
+    except PlaywrightTimeoutError:
+        logger.info("No CAPTCHA modal within 30s.")
+
+    if debug_dir:
+        page.screenshot(path=os.path.join(debug_dir, "05_after_signup.png"),
+                        full_page=True)
+
+    # If no CAPTCHA modal showed up, check for form validation errors
+    # (these would explain why the form didn't submit).
+    if not captcha_present:
+        # Separate locators per engine - DO NOT mix CSS and text= in one selector.
+        for sel in (".error-message", ".invalid-feedback", ".input__error",
+                    ".form-error", "text=This field is required",
+                    "text=already exists", "text=already taken"):
+            try:
+                loc = page.locator(sel).first
+                if loc.count() and loc.is_visible():
+                    logger.error(f"Form validation error ({sel}): "
+                                 f"{loc.inner_text()[:200]}")
+                    return None
+            except Exception:
+                continue
+        logger.info("No CAPTCHA and no validation error - account may already "
+                    "have been created (page navigated).")
+        # Some sites redirect to dashboard on success without a CAPTCHA.
+        # Treat that as success.
+        logger.success(f"Registered: {username}")
+        return {"url": url, "username": username, "password": password, "secret": secret}
+
+    # Solve loop
     success = False
     for attempt in range(1, max_captcha_retries + 1):
+        logger.info(f"Solving clock CAPTCHA (attempt {attempt}/{max_captcha_retries})...")
         try:
-            logger.info(f"Waiting for clock CAPTCHA (attempt {attempt})...")
-            page.wait_for_selector("text=To confirm that you are not a robot",
-                                   timeout=10000)
-
-            modal = page.locator("div").filter(
-                has_text="To confirm that you are not a robot").last
-            clock_el = modal.locator("canvas, img, svg").first
+            # Find the clock image. The modal contains an <img>, <canvas>, or
+            # background-image of the analog clock - try multiple strategies.
+            clock_el = None
+            for sel in (
+                "img[src*='clock']", "img[src*='captcha']",
+                ".captcha img", ".captcha canvas", ".captcha svg",
+                "[class*='captcha'] img", "[class*='captcha'] canvas",
+                "[class*='clock'] img", "[class*='clock'] canvas",
+                "canvas", "svg",
+            ):
+                try:
+                    cand = page.locator(sel).first
+                    if cand.count() and cand.is_visible(timeout=1000):
+                        bbox = cand.bounding_box()
+                        # Only accept big square-ish elements (the clock dial)
+                        if bbox and bbox["width"] >= 120 and bbox["height"] >= 120 \
+                                and 0.6 <= bbox["width"] / bbox["height"] <= 1.7:
+                            clock_el = cand
+                            logger.debug(f"clock element via: {sel}  bbox={bbox}")
+                            break
+                except Exception:
+                    continue
 
             clock_path = os.path.join(debug_dir or ".", f"clock_{attempt}.png")
-            clock_el.screenshot(path=clock_path)
+            if clock_el is not None:
+                clock_el.screenshot(path=clock_path)
+            else:
+                # Fallback: crop the left half of the modal from a full-page shot.
+                logger.warning("Could not isolate clock element - cropping page.")
+                full_path = os.path.join(debug_dir or ".",
+                                         f"clock_fallback_{attempt}_full.png")
+                page.screenshot(path=full_path, full_page=False)
+                img = cv2.imread(full_path)
+                if img is None:
+                    logger.error("Fallback page screenshot unreadable.")
+                    break
+                h, w = img.shape[:2]
+                # Heuristic: clock is roughly centered vertically, left of center
+                crop = img[int(h * 0.20):int(h * 0.80),
+                           int(w * 0.20):int(w * 0.55)]
+                cv2.imwrite(clock_path, crop)
             logger.info(f"Clock screenshot -> {clock_path}")
 
-            time_str = solve_clock(clock_path)
+            time_str = solve_clock(clock_path, debug_dir=debug_dir)
             logger.info(f"Solved time: {time_str}")
 
-            smart_fill(page,
+            ok_t = smart_fill(page,
                 ["input[placeholder='00:00']",
+                 "input[placeholder*=':']",
                  "input[name='captcha_time']",
-                 "input.input__input"],
+                 "input[name='time']",
+                 ".captcha input",
+                 "[class*='captcha'] input"],
                 time_str, label="captcha_time")
+            if not ok_t:
+                logger.error("Could not fill captcha time field.")
+                break
 
-            page.locator("button:has-text('OK')").click(timeout=5000)
+            # Click OK (case-insensitive)
+            try:
+                page.get_by_role("button", name="OK").first.click(timeout=5000)
+            except Exception:
+                page.locator("button:has-text('OK'), button:has-text('Ok')").first.click(timeout=5000)
             page.wait_for_timeout(2500)
 
-            err = page.locator("text=Incorrect time, text=Error")
-            if err.count() > 0 and err.first.is_visible():
-                logger.warning("Wrong time, retrying...")
+            # Check for an error indicator (separate selectors per engine).
+            wrong = False
+            for sel in ("text=Incorrect", "text=incorrect", "text=Wrong time",
+                        "text=Try again", ".captcha-error", ".error"):
+                try:
+                    loc = page.locator(sel).first
+                    if loc.count() and loc.is_visible():
+                        wrong = True
+                        break
+                except Exception:
+                    continue
+            if wrong:
+                logger.warning(f"Clock time '{time_str}' rejected, retrying...")
                 continue
 
             logger.info("CAPTCHA accepted.")
             success = True
             break
 
-        except PlaywrightTimeoutError:
-            # Look for validation errors that may have prevented CAPTCHA
-            err = page.locator(".error-message, .invalid-feedback, "
-                               "text=This field is required").first
-            if err.count() and err.is_visible():
-                logger.error(f"Form validation error: {err.inner_text()}")
-                break
-            logger.info("No CAPTCHA appeared — likely already registered.")
-            success = True
-            break
+        except PlaywrightTimeoutError as e:
+            logger.warning(f"CAPTCHA attempt {attempt} timed out: {e}")
+            continue
         except Exception as e:
-            logger.error(f"CAPTCHA error: {e}")
-            break
+            logger.error(f"CAPTCHA attempt {attempt} error: {e}")
+            continue
 
     if success:
         logger.success(f"Registered: {username}")
         return {"url": url, "username": username, "password": password, "secret": secret}
-    logger.error("Registration flow failed.")
+    logger.error("Registration flow failed at CAPTCHA stage.")
+    if debug_dir:
+        page.screenshot(path=os.path.join(debug_dir, "99_captcha_failed.png"),
+                        full_page=True)
     return None
 
 

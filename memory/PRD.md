@@ -20,6 +20,12 @@ Python automation using Playwright to register accounts on `https://styxmarket.s
 - Added `--count N` for batch registrations with human-like delays.
 - Pre-flight datacenter-IP detector (`ipinfo.io`) warns loudly when egress IP belongs to Azure/AWS/GCP/DO/OVH/Hetzner/Linode/Vultr/Oracle.
 - `requirements.txt` + `README.md` for one-command install (`pip install -r requirements.txt && patchright install chrome`).
+- **Cloudflare confirmed bypassed** (Feb 2026 user run — form rendered & submitted successfully).
+- Fixed crash on broken mixed CSS+text selector (`.error-message, ..., text=This field is required`) - now uses separate locators per Playwright engine.
+- Rewrote CAPTCHA wait to use `page.wait_for_function` with multi-signal detection (placeholder, OK button, prompt text); timeout bumped 10s → 30s.
+- Added full-page debug screenshots before/after Sign-up click and on failure (`05_after_signup.png`, `99_captcha_failed.png`).
+- **Completely rewrote `solve_clock()`** with a robust algorithm: HoughCircles → mask outside dial → Otsu threshold → punch hub hole to separate hands → connected components → tip detection → minute-aware hour decoding. **Passes 10/10 synthetic Styx-style tests.**
+- Added `tests/test_clock_solver.py` and `tests/test_clock_styx_like.py` regression suites.
 
 ### P1 backlog
 - If patchright + residential proxy *still* gets blocked, fall through automatically to camoufox.
