@@ -1694,49 +1694,140 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None):
     # --- 2) Open the header cart ---------------------------------------------
     # The site header (top-right) has icons:  flag | mail | bell | CART | menu.
     # The cart icon usually carries a badge with the item count.
+    #
+    # IMPORTANT: scroll to the top of the page FIRST. The previous step may
+    # have scrolled the product row into view (Styx's product list is long,
+    # the row was at y~368), and Styx's header is not always position:fixed -
+    # so it can be entirely off-screen by the time we look for it. Without
+    # this scroll, `getBoundingClientRect()` returns negative top/bottom and
+    # our viewport filter kicks the header cart out.
     logger.info("Opening header cart...")
+    try:
+        page.evaluate("() => window.scrollTo({ top: 0, behavior: 'instant' })")
+    except Exception:
+        # 'instant' isn't supported in all engines; fall back to default.
+        try:
+            page.evaluate("() => window.scrollTo(0, 0)")
+        except Exception as e:
+            logger.debug(f"  scroll-to-top failed (non-fatal): {e}")
+    time.sleep(random.uniform(0.6, 1.0))
+    if debug_dir:
+        page.screenshot(path=os.path.join(debug_dir, "23a_scrolled_to_top.png"),
+                        full_page=False)
+
     header_cart = page.evaluate(
         """() => {
             // Find an element in the top-area of the page (small y, large x)
-            // that looks cart-shaped. Filter by position to avoid clicking
-            // the row-cart icon again.
+            // that looks cart-shaped. We mirror the strict tier-1/tier-2
+            // selection used for the row cart:
+            //   * INCLUDE only elements whose class / aria / title /
+            //     data-tip contains an explicit cart token.
+            //   * EXCLUDE mail / star / heart / info / share / bell / etc.
+            //     - critical because the Styx header has a mail icon (with
+            //     its own count badge) right next to the cart, and we used
+            //     to mis-pick it.
+            //   * Among matches, pick the one closest to the TOP-RIGHT
+            //     corner of the viewport.
             const vh = window.innerHeight;
             const vw = window.innerWidth;
-            const cartRx = /(^|[\\s_-])cart([\\s_-]|$)|shopping[-_]?cart|basket|header-?cart/i;
-            const all = Array.from(document.querySelectorAll('a, button, svg, div, span, i'));
-            // candidates near the top header area: y < 120, x > vw/2.
-            const cands = all.filter(el => {
-                const r = el.getBoundingClientRect();
-                if (r.top > 140 || r.bottom < 0 || r.width < 8 || r.height < 8) return false;
-                if (r.left < vw * 0.4) return false;
-                const cls = (el.className && el.className.toString) ? el.className.toString() : '';
+            const includeRx = /(^|[\\s_-])cart([\\s_-]|$)|shopping[-_]?cart|basket|trolley|header[-_]?cart/i;
+            const excludeRx = /mail|envelope|message|chat|letter|email|inbox|star|fav(ou)?rite|heart|like|bookmark|info|question|tooltip|share|copy|external[-_]?link|link[-_]?icon|bell|notification|delete|remove|trash|edit|menu|hamburger|search|filter|sort|user[-_]?avatar|profile|account[-_]?menu/i;
+            const idOf = (el) => {
+                const cls = (el.className && el.className.toString)
+                                ? el.className.toString() : '';
                 const al = el.getAttribute && (
-                    el.getAttribute('aria-label') || el.getAttribute('title') ||
-                    el.getAttribute('data-tip')   || el.getAttribute('data-tooltip') || '');
-                return cartRx.test(cls) || (al && cartRx.test(al));
+                       el.getAttribute('aria-label') || el.getAttribute('title')
+                    || el.getAttribute('data-tip')   || el.getAttribute('data-tooltip')
+                    || el.getAttribute('data-original-title') || '');
+                const href = el.getAttribute && (el.getAttribute('href') || '');
+                return cls + ' ' + (al || '') + ' ' + (href || '');
+            };
+            const all = Array.from(document.querySelectorAll('a, button, svg, div, span, i'));
+
+            // Top-area candidates: must be in the upper ~180px AND in the
+            // right half of the screen. After our scrollTo(0,0) the header
+            // should be at the top of the viewport.
+            const inTopRight = (el) => {
+                const r = el.getBoundingClientRect();
+                if (r.top < 0 || r.top > 180) return false;
+                if (r.bottom < 0) return false;
+                if (r.left < vw * 0.4) return false;
+                if (r.width < 8 || r.height < 8) return false;
+                return true;
+            };
+
+            // Tier 1: explicit cart-tagged, not excluded, in top-right.
+            const tier1 = all.filter(el => {
+                if (!inTopRight(el)) return false;
+                const t = idOf(el);
+                return includeRx.test(t) && !excludeRx.test(t);
             });
-            // Prefer the one closest to the top-right corner.
-            cands.sort((a, b) => {
-                const ra = a.getBoundingClientRect();
-                const rb = b.getBoundingClientRect();
-                const da = Math.hypot(vw - ra.right, ra.top);
-                const db = Math.hypot(vw - rb.right, rb.top);
-                return da - db;
+
+            // Tier 2: ANY element in the top-right whose href contains
+            // '/cart' or '/basket' - useful if cart is a link without
+            // any cart-class but with a meaningful URL.
+            const tier2 = all.filter(el => {
+                if (!inTopRight(el)) return false;
+                const href = (el.getAttribute && el.getAttribute('href')) || '';
+                return /\\/cart|\\/basket|\\/checkout/i.test(href);
             });
-            // Walk up to a clickable parent (button/a) if we landed on an svg.
-            let target = cands[0];
-            if (target) {
-                let cur = target;
+
+            const sortByCornerDistance = (arr) => {
+                arr.sort((a, b) => {
+                    const ra = a.getBoundingClientRect();
+                    const rb = b.getBoundingClientRect();
+                    const da = Math.hypot(vw - ra.right, ra.top);
+                    const db = Math.hypot(vw - rb.right, rb.top);
+                    return da - db;
+                });
+                return arr;
+            };
+
+            // Walk up to the most-clickable ancestor (button/a) - the SVG
+            // child usually isn't the click target.
+            const toClickable = (el) => {
+                let cur = el;
                 for (let i = 0; i < 4 && cur && cur.parentElement; i++) {
                     const p = cur.parentElement;
                     const tag = (p.tagName || '').toLowerCase();
                     if (tag === 'button' || tag === 'a' || p.onclick != null) {
-                        target = p; break;
+                        return p;
                     }
                     cur = p;
                 }
+                return el;
+            };
+
+            sortByCornerDistance(tier1);
+            sortByCornerDistance(tier2);
+
+            // Build the final list and dedupe by clickable wrapper.
+            const ranked = [];
+            const seen = new Set();
+            const tier1Wrapped = tier1.map(toClickable);
+            const tier2Wrapped = tier2.map(toClickable);
+            for (const el of [...tier1Wrapped, ...tier2Wrapped]) {
+                if (seen.has(el)) continue;
+                seen.add(el);
+                ranked.push(el);
             }
-            if (!target) return { ok: false, reason: 'no header-cart candidate' };
+
+            if (ranked.length === 0) {
+                // Diagnostic dump for the top-right area, sorted by distance.
+                const dump = all.filter(inTopRight).slice(0, 25).map(el => ({
+                    tag: el.tagName,
+                    cls: (el.className && el.className.toString)
+                            ? el.className.toString().slice(0, 80) : '',
+                    aria: el.getAttribute && el.getAttribute('aria-label'),
+                    title: el.getAttribute && el.getAttribute('title'),
+                    href: el.getAttribute && el.getAttribute('href'),
+                    rect: (() => { const r = el.getBoundingClientRect();
+                                   return { l: r.left, t: r.top, r: r.right, b: r.bottom }; })(),
+                }));
+                return { ok: false, reason: 'no header-cart candidate', topRightItems: dump };
+            }
+
+            const target = ranked[0];
             try { target.scrollIntoView({block: 'center'}); } catch (e) {}
             const r = target.getBoundingClientRect();
             return {
@@ -1747,6 +1838,9 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None):
                 tag: target.tagName,
                 cls: (target.className && target.className.toString)
                         ? target.className.toString().slice(0, 100) : '',
+                href: target.getAttribute && target.getAttribute('href'),
+                tier: tier1.length > 0 ? 1 : 2,
+                rankedCount: ranked.length,
             };
         }"""
     )
