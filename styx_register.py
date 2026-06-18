@@ -435,23 +435,104 @@ def do_topup(page, amount, currency_label="BNB (BEP20)",
     # 1) Click the crypto tile (e.g. "BNB (BEP20)")
     logger.info(f"Selecting crypto: {currency_label}")
     clicked = False
-    # Try a wide variety of selectors, role-based first (most robust).
-    strategies = [
-        lambda: page.get_by_role("button", name=currency_label, exact=True).first.click(timeout=4000),
-        lambda: page.get_by_text(currency_label, exact=True).first.click(timeout=4000),
-        lambda: page.locator(f"button:has-text('{currency_label}')").first.click(timeout=4000),
-        lambda: page.locator(f"[class*='currency']:has-text('{currency_label}')").first.click(timeout=4000),
-        lambda: page.locator(f"div:has-text('{currency_label}')").first.click(timeout=4000),
-        lambda: page.locator(f"a:has-text('{currency_label}')").first.click(timeout=4000),
-    ]
-    for i, strat in enumerate(strategies, 1):
-        try:
-            strat()
+    click_info = None
+
+    # Primary strategy: JS-based. Find the leaf element whose text matches
+    # EXACTLY (trimmed), walk up to the first clickable ancestor (button, a,
+    # role=button, onclick, or cursor:pointer), scroll into view, dispatch a
+    # real MouseEvent. This handles the common case where the tile is a div
+    # wrapping an <img> icon + a <span> label, and only the wrapper has the
+    # click handler.
+    try:
+        click_info = page.evaluate(
+            """(label) => {
+                const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+                const want = norm(label);
+                // Collect leaf-ish elements whose own text matches exactly.
+                const all = Array.from(document.querySelectorAll('div, span, button, a, p, label, li'));
+                const exact = all.filter(el => {
+                    const own = norm(Array.from(el.childNodes)
+                        .filter(n => n.nodeType === 3)
+                        .map(n => n.textContent).join(''));
+                    if (own === want) return true;
+                    return norm(el.textContent) === want && el.children.length <= 2;
+                });
+                if (exact.length === 0) return { ok: false, reason: 'no text match' };
+
+                const isClickable = (el) => {
+                    if (!el || !el.tagName) return false;
+                    const t = el.tagName.toLowerCase();
+                    if (t === 'button' || t === 'a') return true;
+                    const role = el.getAttribute && el.getAttribute('role');
+                    if (role === 'button' || role === 'link' || role === 'tab') return true;
+                    if (el.onclick != null) return true;
+                    try {
+                        if (getComputedStyle(el).cursor === 'pointer') return true;
+                    } catch (e) {}
+                    return false;
+                };
+
+                for (const m of exact) {
+                    let cur = m;
+                    for (let i = 0; i < 10 && cur; i++) {
+                        if (isClickable(cur)) {
+                            try { cur.scrollIntoView({block: 'center'}); } catch (e) {}
+                            // Dispatch a full mouse sequence so frameworks listening
+                            // for mousedown/mouseup also see it.
+                            const rect = cur.getBoundingClientRect();
+                            const x = rect.left + rect.width / 2;
+                            const y = rect.top + rect.height / 2;
+                            for (const type of ['mouseover','mousedown','mouseup','click']) {
+                                cur.dispatchEvent(new MouseEvent(type, {
+                                    bubbles: true, cancelable: true,
+                                    clientX: x, clientY: y, button: 0,
+                                }));
+                            }
+                            return {
+                                ok: true,
+                                tag: cur.tagName,
+                                cls: cur.className,
+                                text: norm(cur.textContent).slice(0, 80),
+                            };
+                        }
+                        cur = cur.parentElement;
+                    }
+                }
+                return { ok: false, reason: 'no clickable ancestor' };
+            }""",
+            currency_label,
+        )
+        if click_info and click_info.get("ok"):
             clicked = True
-            logger.info(f"  -> clicked '{currency_label}' (strategy {i})")
-            break
-        except Exception as e:
-            logger.debug(f"  topup tile strategy {i} failed: {e}")
+            logger.info(f"  -> JS click on '{currency_label}': {click_info}")
+    except Exception as e:
+        logger.debug(f"  JS-based tile click failed: {e}")
+
+    # Fallback strategies (only if the JS approach failed)
+    if not clicked:
+        strategies = [
+            ("role=button exact",
+             lambda: page.get_by_role("button", name=currency_label, exact=True)
+                          .first.click(timeout=4000)),
+            ("text exact",
+             lambda: page.get_by_text(currency_label, exact=True).first
+                          .click(timeout=4000)),
+            ("button:has-text",
+             lambda: page.locator(f"button:has-text('{currency_label}')")
+                          .first.click(timeout=4000)),
+            ("[class*=currency]:has-text",
+             lambda: page.locator(f"[class*='currency']:has-text('{currency_label}')")
+                          .first.click(timeout=4000)),
+        ]
+        for name, strat in strategies:
+            try:
+                strat()
+                clicked = True
+                logger.info(f"  -> clicked '{currency_label}' (fallback: {name})")
+                break
+            except Exception as e:
+                logger.debug(f"  topup tile fallback '{name}' failed: {e}")
+
     if not clicked:
         logger.error(f"Could not click currency tile '{currency_label}'.")
         if debug_dir:
@@ -463,6 +544,58 @@ def do_topup(page, amount, currency_label="BNB (BEP20)",
     if debug_dir:
         page.screenshot(path=os.path.join(debug_dir, "12_topup_tile_selected.png"),
                         full_page=True)
+
+    # 1b) VERIFY the right tile is actually selected. The selected tile
+    # typically gets an active/selected/checked class or an ARIA attr.
+    try:
+        sel_info = page.evaluate(
+            """(label) => {
+                const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+                const want = norm(label);
+                // Find candidate tiles (anything containing exactly our label)
+                const tiles = Array.from(document.querySelectorAll('*'))
+                    .filter(el => norm(el.textContent) === want && el.children.length <= 5);
+                let selectedNear = false;
+                let nearestSelectedText = null;
+                // What does "selected" look like? Walk up from our tile and check
+                // if any ancestor has a selected/active/checked class or attr.
+                const looksSelected = (el) => {
+                    const cls = (el.className && el.className.toString) ?
+                                el.className.toString() : '';
+                    if (/active|selected|checked|chosen|current/i.test(cls)) return true;
+                    const aria = el.getAttribute && el.getAttribute('aria-selected');
+                    if (aria === 'true') return true;
+                    const pressed = el.getAttribute && el.getAttribute('aria-pressed');
+                    if (pressed === 'true') return true;
+                    return false;
+                };
+                for (const t of tiles) {
+                    let cur = t;
+                    for (let i = 0; i < 6 && cur; i++) {
+                        if (looksSelected(cur)) { selectedNear = true; break; }
+                        cur = cur.parentElement;
+                    }
+                    if (selectedNear) break;
+                }
+                // Also find what IS currently selected (for diagnostics).
+                const anySelected = Array.from(document.querySelectorAll(
+                    "[class*='active'], [class*='selected'], [class*='checked'], "
+                    + "[aria-selected='true'], [aria-pressed='true']"
+                )).map(el => norm(el.textContent)).filter(t => t && t.length < 60);
+                return {
+                    matched: tiles.length,
+                    selectedNear: selectedNear,
+                    nearby: anySelected.slice(0, 6),
+                };
+            }""",
+            currency_label,
+        )
+        logger.info(f"  selection check: {sel_info}")
+        if not sel_info.get("selectedNear"):
+            logger.warning(f"'{currency_label}' may NOT be selected. "
+                           f"Current selection candidates: {sel_info.get('nearby')}")
+    except Exception as e:
+        logger.debug(f"selection verification failed: {e}")
 
     # 2) Fill the Payment Amount input
     logger.info(f"Entering payment amount: {amount}")
