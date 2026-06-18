@@ -119,8 +119,8 @@ def process_registration(page, url, max_captcha_retries=3):
 
     # 2. Registration Form
     logger.info("Waiting for Registration form to load...")
-    # Wait for the username field to be present
-    page.wait_for_selector("input[name='username']:visible", timeout=15000)
+    # Wait for the registration form container to be present
+    page.wait_for_selector("div.sign-up-form__body, div.sign-up__form", timeout=15000)
     
     username = f"user_{generate_random_string(8)}"
     password = generate_password()
@@ -128,18 +128,24 @@ def process_registration(page, url, max_captcha_retries=3):
     
     logger.info(f"Generated - User: {username}")
     
-    page.locator("input[name='username']:visible").first.fill(username)
-    page.locator("input[name='password']:visible").first.fill(password)
+    # Scope our locators strictly to the sign-up form to avoid hidden inputs elsewhere on the page
+    form = page.locator("div.sign-up-form__body, div.sign-up__form").first
     
-    # Try different possible names for the secret code field, or fallback to the 3rd input in the form
-    secret_locator = page.locator("input[name='secret_code']:visible, input[name='secret']:visible, input[name='pin']:visible")
-    if secret_locator.count() > 0:
-        secret_locator.first.fill(secret)
-    else:
-        # Fallback to the 3rd input field in the sign up form body
-        page.locator("div.sign-up-form__body input").nth(2).fill(secret)
-    
-    page.locator("button:has-text('Sign up'):visible, button[type='submit']:visible, form button:visible").first.click()
+    # Fallback sequentially through structural selectors if name attributes fail
+    try:
+        form.locator("input").nth(0).fill(username, timeout=5000)
+        form.locator("input").nth(1).fill(password, timeout=5000)
+        form.locator("input").nth(2).fill(secret, timeout=5000)
+    except Exception as e:
+        logger.warning(f"Structural fill failed, trying by name... {e}")
+        form.locator("input[name='username']").fill(username)
+        form.locator("input[name='password']").fill(password)
+        
+        secret_locator = form.locator("input[name='secret_code'], input[name='secret'], input[name='pin']")
+        if secret_locator.count() > 0:
+            secret_locator.first.fill(secret)
+            
+    page.locator("button:has-text('Sign up'):visible, button[type='submit']:visible, div.sign-up__form button").first.click()
     logger.info("Submitted Registration Form.")
 
     # 3. Time Verification / Clock CAPTCHA
