@@ -128,24 +128,27 @@ def process_registration(page, url, max_captcha_retries=3):
     
     logger.info(f"Generated - User: {username}")
     
-    # Scope our locators strictly to the sign-up form to avoid hidden inputs elsewhere on the page
+    # Scope our locators strictly to the sign-up form
     form = page.locator("div.sign-up-form__body, div.sign-up__form").first
     
-    # Fallback sequentially through structural selectors if name attributes fail
+    # Force fill on exact name attributes to bypass hidden/un-interactable states
     try:
-        form.locator("input").nth(0).fill(username, timeout=5000)
-        form.locator("input").nth(1).fill(password, timeout=5000)
-        form.locator("input").nth(2).fill(secret, timeout=5000)
-    except Exception as e:
-        logger.warning(f"Structural fill failed, trying by name... {e}")
-        form.locator("input[name='username']").fill(username)
-        form.locator("input[name='password']").fill(password)
+        logger.info("Attempting forced fill...")
+        form.locator("input[name='username']").first.fill(username, force=True, timeout=5000)
+        form.locator("input[name='password']").first.fill(password, force=True, timeout=5000)
         
+        # Determine secret code input
         secret_locator = form.locator("input[name='secret_code'], input[name='secret'], input[name='pin']")
         if secret_locator.count() > 0:
-            secret_locator.first.fill(secret)
+            secret_locator.first.fill(secret, force=True, timeout=5000)
+        else:
+            # Fallback to the third text/password input
+            form.locator("input[type='text'], input[type='password']").nth(2).fill(secret, force=True, timeout=5000)
             
-    page.locator("button:has-text('Sign up'):visible, button[type='submit']:visible, div.sign-up__form button").first.click()
+    except Exception as e:
+        logger.warning(f"Fill failed. Error: {e}")
+        
+    page.locator("button:has-text('Sign up'), button[type='submit'], div.sign-up__form button").first.click(force=True)
     logger.info("Submitted Registration Form.")
 
     # 3. Time Verification / Clock CAPTCHA
