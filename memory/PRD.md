@@ -13,6 +13,23 @@ Python automation using Playwright to register accounts on `https://styxmarket.s
 ## Implementation status (Feb 2026)
 
 ### Done
+- **Feb 2026 — Fixed BNB → TRX top-up tile selection bug.** Root cause: prior
+  iteration clicked the crypto tile via JS `target.dispatchEvent(new MouseEvent('click', ...))`.
+  Modern frontends (React/Vue) gate state changes on `event.isTrusted === true`,
+  so the synthetic click was silently ignored and the default tile (TRX) stayed
+  selected — but the script reported "clicked OK" and proceeded, producing a
+  TRX deposit address instead of BNB. Fix in `do_topup()`:
+    1. Primary click is now Playwright's native locator click
+       (`page.locator(".wallet-currency-toggler", has=...).click()`) — trusted.
+    2. Fallback uses `page.mouse.click(x, y)` at the tile's bounding-box center
+       (real CDP `Input.dispatchMouseEvent`, also trusted).
+    3. Removed all `dispatchEvent(new MouseEvent(...))` paths.
+    4. Selection detector rewritten to (a) check direct a11y/data attrs and
+       checked inputs, and (b) diff classNames vs sibling tiles using
+       majority-intersection (so "active" moving between tiles is detected
+       symmetrically) — no longer fooled by frameworks that don't use `active`.
+    5. Up to 2 retries via trusted mouse click before aborting; aborts loudly
+       if the wrong tile is highlighted (prevents wrong-coin deposits).
 - Removed silent `patchright → playwright` fallback (root cause of last user failure). Script now exits with a clear install message if patchright missing.
 - Cross-platform profile dir via `tempfile.gettempdir()` (works on Windows/macOS/Linux).
 - Added `--proxy` CLI flag + `STYX_PROXY` env var. Plumbed through both engines.

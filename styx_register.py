@@ -433,118 +433,285 @@ def do_topup(page, amount, currency_label="BNB (BEP20)",
                         full_page=True)
 
     # 1) Click the crypto tile (e.g. "BNB (BEP20)")
+    #
+    # IMPORTANT: We MUST use trusted events here. Modern frontends
+    # (React/Vue/etc.) gate state changes on `event.isTrusted === true`, so a
+    # JS `dispatchEvent(new MouseEvent('click', ...))` is silently ignored and
+    # the default tile (TRX) stays selected. That's the exact bug we are
+    # fixing in this iteration: every prior synthetic-click strategy did
+    # nothing visible to the framework, the user kept getting TRX deposit
+    # addresses, and the script falsely reported success.
+    #
+    # Trusted events come from:
+    #   - Playwright's native locator `.click()` (drives a real input pipeline)
+    #   - `page.mouse.click(x, y)` (real CDP "Input.dispatchMouseEvent" - OS-level)
+    # So this section is structured: native locator click -> mouse.click at
+    # the tile's bounding-box center -> only then falls back to other selectors.
     logger.info(f"Selecting crypto: {currency_label}")
     clicked = False
-    click_info = None
+    sel = None  # result of the selection check (used in retry/abort logic)
 
-    # Primary strategy: target Styx's known DOM structure directly.
-    # Each tile is:
-    #   <... class="wallet-currency-toggler ...">
-    #     <div class="wallet-currency-toggler__title wct-with-icon">
-    #       <span class="wct-coin-icon"><svg/></span>
-    #       <span class="wct-coin-name">BNB (BEP20)</span>
-    #     </div>
-    #   </...>
-    # We find the .wct-coin-name with matching text, walk up to the nearest
-    # ancestor whose class contains 'toggler' (the actual clickable tile),
-    # scroll into view, and dispatch a full mouse event sequence.
-    try:
-        click_info = page.evaluate(
-            """(label) => {
-                const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
-                const want = norm(label);
+    # ---- Helper: locate the tile element, return its bounding box (in CSS px)
+    # We resolve via the SAME DOM walk we used before (find the .wct-coin-name
+    # with exact text, walk up to the .wallet-currency-toggler ancestor) but
+    # this time we ONLY use JS to compute the bounding box. The actual click
+    # is done from Python via page.mouse, which is a trusted event.
+    def _find_tile_box():
+        try:
+            return page.evaluate(
+                """(label) => {
+                    const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+                    const want = norm(label);
 
-                // 1) Styx-specific: find by .wct-coin-name
-                const nameEls = Array.from(document.querySelectorAll('.wct-coin-name'));
-                let matched = nameEls.find(el => norm(el.textContent) === want);
+                    // 1) Styx-specific: find by .wct-coin-name
+                    const nameEls = Array.from(document.querySelectorAll('.wct-coin-name'));
+                    let matched = nameEls.find(el => norm(el.textContent) === want);
 
-                // 2) Fallback: any leaf-ish element whose own text matches exactly
-                if (!matched) {
-                    const all = Array.from(document.querySelectorAll('div, span, button, a, p, label, li'));
-                    matched = all.find(el => {
-                        const own = norm(Array.from(el.childNodes)
-                            .filter(n => n.nodeType === 3)
-                            .map(n => n.textContent).join(''));
-                        return own === want;
-                    });
-                }
-                if (!matched) return { ok: false, reason: 'no text match' };
+                    // 2) Fallback: any element whose OWN direct text node matches
+                    if (!matched) {
+                        const all = Array.from(document.querySelectorAll('div, span, button, a, p, label, li'));
+                        matched = all.find(el => {
+                            const own = norm(Array.from(el.childNodes)
+                                .filter(n => n.nodeType === 3)
+                                .map(n => n.textContent).join(''));
+                            return own === want;
+                        });
+                    }
+                    if (!matched) return { ok: false, reason: 'no text match' };
 
-                // Walk up: prefer ancestors whose className contains 'toggler'
-                // (Styx-specific), then anything clickable (button/a/role/cursor:pointer).
-                const isStyxTile = (el) => {
-                    if (!el || !el.className || !el.className.toString) return false;
-                    return /wallet-currency-toggler(?!__)/i.test(el.className.toString());
-                };
-                const isClickable = (el) => {
-                    if (!el || !el.tagName) return false;
-                    const t = el.tagName.toLowerCase();
-                    if (t === 'button' || t === 'a') return true;
-                    const role = el.getAttribute && el.getAttribute('role');
-                    if (role === 'button' || role === 'link' || role === 'tab') return true;
-                    if (el.onclick != null) return true;
-                    try { if (getComputedStyle(el).cursor === 'pointer') return true; } catch (e) {}
-                    return false;
-                };
+                    // Walk up to the nearest tile-like ancestor.
+                    const isStyxTile = (el) => {
+                        if (!el || !el.className || !el.className.toString) return false;
+                        return /wallet-currency-toggler(?!__)/i.test(el.className.toString());
+                    };
+                    const isClickable = (el) => {
+                        if (!el || !el.tagName) return false;
+                        const t = el.tagName.toLowerCase();
+                        if (t === 'button' || t === 'a' || t === 'label') return true;
+                        const role = el.getAttribute && el.getAttribute('role');
+                        if (role === 'button' || role === 'link' || role === 'tab' || role === 'radio') return true;
+                        if (el.onclick != null) return true;
+                        try { if (getComputedStyle(el).cursor === 'pointer') return true; } catch (e) {}
+                        return false;
+                    };
 
-                let target = null;
-                let cur = matched;
-                // Pass 1: find a Styx tile ancestor.
-                for (let i = 0; i < 10 && cur; i++) {
-                    if (isStyxTile(cur)) { target = cur; break; }
-                    cur = cur.parentElement;
-                }
-                // Pass 2: fall back to any clickable ancestor.
-                if (!target) {
-                    cur = matched;
+                    let target = null;
+                    let cur = matched;
                     for (let i = 0; i < 10 && cur; i++) {
-                        if (isClickable(cur)) { target = cur; break; }
+                        if (isStyxTile(cur)) { target = cur; break; }
                         cur = cur.parentElement;
                     }
-                }
-                if (!target) return { ok: false, reason: 'no clickable ancestor', text: norm(matched.textContent) };
+                    if (!target) {
+                        cur = matched;
+                        for (let i = 0; i < 10 && cur; i++) {
+                            if (isClickable(cur)) { target = cur; break; }
+                            cur = cur.parentElement;
+                        }
+                    }
+                    if (!target) {
+                        return { ok: false, reason: 'no clickable ancestor',
+                                 text: norm(matched.textContent) };
+                    }
 
-                try { target.scrollIntoView({block: 'center'}); } catch (e) {}
-                const rect = target.getBoundingClientRect();
-                const x = rect.left + rect.width / 2;
-                const y = rect.top + rect.height / 2;
-                for (const type of ['mouseover','mouseenter','mousedown','mouseup','click']) {
-                    target.dispatchEvent(new MouseEvent(type, {
-                        bubbles: true, cancelable: true,
-                        clientX: x, clientY: y, button: 0, view: window,
-                    }));
-                }
-                return {
-                    ok: true,
-                    tag: target.tagName,
-                    cls: (target.className && target.className.toString)
-                            ? target.className.toString() : '',
-                    text: norm(target.textContent).slice(0, 80),
-                };
-            }""",
-            currency_label,
-        )
-        if click_info and click_info.get("ok"):
-            clicked = True
-            logger.info(f"  -> JS click on '{currency_label}': {click_info}")
-        else:
-            logger.debug(f"  JS click returned: {click_info}")
+                    try { target.scrollIntoView({block: 'center', inline: 'center'}); } catch (e) {}
+                    const rect = target.getBoundingClientRect();
+                    if (!rect || rect.width < 1 || rect.height < 1) {
+                        return { ok: false, reason: 'zero-size rect',
+                                 rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height } };
+                    }
+                    return {
+                        ok: true,
+                        x: rect.left + rect.width / 2,
+                        y: rect.top + rect.height / 2,
+                        w: rect.width,
+                        h: rect.height,
+                        tag: target.tagName,
+                        cls: (target.className && target.className.toString)
+                                ? target.className.toString() : '',
+                    };
+                }""",
+                currency_label,
+            )
+        except Exception as e:
+            logger.debug(f"  bounding-box lookup failed: {e}")
+            return None
+
+    # ---- Helper: is the tile selected? Returns dict {ok, selected, cls, ...}
+    #
+    # We can't rely on /active|selected/i alone - Styx's actual selected-state
+    # class isn't standardized. Instead we DIFF the candidate tile's classes
+    # against the other sibling tiles: the one with the unique class is the
+    # selected one. We also check the usual a11y / form-state signals.
+    def _is_selected():
+        try:
+            return page.evaluate(
+                """(label) => {
+                    const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+                    const want = norm(label);
+                    const nameEls = Array.from(document.querySelectorAll('.wct-coin-name'));
+
+                    // Helper: find the .wallet-currency-toggler ancestor.
+                    const tileOf = (el) => {
+                        let cur = el;
+                        for (let i = 0; i < 10 && cur; i++) {
+                            const cls = (cur.className && cur.className.toString)
+                                           ? cur.className.toString() : '';
+                            if (/wallet-currency-toggler(?!__)/i.test(cls)) return cur;
+                            cur = cur.parentElement;
+                        }
+                        return null;
+                    };
+
+                    const targetName = nameEls.find(el => norm(el.textContent) === want);
+                    if (!targetName) return { ok: false, reason: 'tile not in DOM' };
+                    const target = tileOf(targetName);
+                    if (!target) return { ok: false, reason: 'no toggler ancestor' };
+
+                    // All sibling tiles (other coins on the same page).
+                    const allTiles = Array.from(document.querySelectorAll('.wallet-currency-toggler'))
+                        .filter(el => !/__/.test(el.className.toString()));
+
+                    const labels = allTiles.map(t => {
+                        const n = t.querySelector('.wct-coin-name');
+                        return n ? norm(n.textContent) : '';
+                    });
+                    const targetCls = target.className.toString();
+                    const targetClsSet = new Set(targetCls.split(/\\s+/).filter(Boolean));
+
+                    // (1) Direct signals on the tile itself.
+                    const directSelected =
+                           /active|selected|checked|chosen|current|--is-|is-active|is-selected/i.test(targetCls)
+                        || target.getAttribute('aria-selected') === 'true'
+                        || target.getAttribute('aria-pressed') === 'true'
+                        || target.getAttribute('data-active') === 'true'
+                        || target.getAttribute('data-selected') === 'true';
+
+                    // (2) Hidden input / radio inside the tile.
+                    let inputChecked = false;
+                    const inputs = target.querySelectorAll('input');
+                    inputs.forEach(inp => { if (inp.checked) inputChecked = true; });
+
+                    // (3) Class-diff vs siblings.
+                    // The "selected" tile is the one whose class set is the
+                    // MINORITY: every other tile shares some class it doesn't
+                    // have (or vice-versa). We compute, for each sibling, the
+                    // set of classes that distinguish it from the target. The
+                    // tile with the most siblings that look identical to each
+                    // other but different from itself is the selected one.
+                    //
+                    // Concrete check: the target is "selected by diff" iff
+                    // there exists at least one class C such that the target
+                    // has C and NO sibling has C  (target is uniquely "on"),
+                    // OR every sibling has a class C that the target lacks
+                    // AND all siblings agree on that class (siblings share an
+                    // "inactive" marker the target alone is missing).
+                    const siblingClsSets = allTiles
+                        .filter(t => t !== target)
+                        .map(t => new Set(t.className.toString().split(/\\s+/).filter(Boolean)));
+
+                    // Classes target has that NO sibling has.
+                    const uniqueToTarget = [];
+                    for (const c of targetClsSet) {
+                        if (siblingClsSets.every(s => !s.has(c))) {
+                            uniqueToTarget.push(c);
+                        }
+                    }
+                    // Classes EVERY sibling has but the target lacks.
+                    const uniqueToOthers = [];
+                    if (siblingClsSets.length > 0) {
+                        const intersect = new Set(siblingClsSets[0]);
+                        for (let i = 1; i < siblingClsSets.length; i++) {
+                            for (const c of Array.from(intersect)) {
+                                if (!siblingClsSets[i].has(c)) intersect.delete(c);
+                            }
+                        }
+                        for (const c of intersect) {
+                            if (!targetClsSet.has(c)) uniqueToOthers.push(c);
+                        }
+                    }
+                    const diffSelected = uniqueToTarget.length > 0 || uniqueToOthers.length > 0;
+
+                    // Which tile does the page currently appear to highlight?
+                    let highlighted = null;
+                    for (const t of allTiles) {
+                        const cls = t.className.toString();
+                        if (/active|selected|checked|chosen|current|--is-|is-active|is-selected/i.test(cls)
+                            || t.getAttribute('aria-selected') === 'true'
+                            || t.getAttribute('aria-pressed') === 'true'
+                            || t.getAttribute('data-active') === 'true'
+                            || t.getAttribute('data-selected') === 'true'
+                            || Array.from(t.querySelectorAll('input')).some(i => i.checked)) {
+                            const n = t.querySelector('.wct-coin-name');
+                            highlighted = n ? norm(n.textContent) : '';
+                            break;
+                        }
+                    }
+
+                    return {
+                        ok: true,
+                        selected: directSelected || inputChecked || diffSelected,
+                        directSelected: directSelected,
+                        inputChecked: inputChecked,
+                        diffSelected: diffSelected,
+                        uniqueToTarget: uniqueToTarget,
+                        uniqueToOthers: uniqueToOthers,
+                        highlighted: highlighted,
+                        targetCls: targetCls,
+                        tilesFound: labels,
+                    };
+                }""",
+                currency_label,
+            )
+        except Exception as e:
+            logger.debug(f"selection check failed: {e}")
+            return None
+
+    # ----- Strategy A: NATIVE Playwright locator click (trusted) -----
+    try:
+        tile_loc = page.locator(
+            ".wallet-currency-toggler",
+            has=page.locator(".wct-coin-name", has_text=currency_label),
+        ).first
+        tile_loc.scroll_into_view_if_needed(timeout=4000)
+        tile_loc.click(timeout=5000)
+        clicked = True
+        logger.info(f"  -> clicked '{currency_label}' via Playwright locator (trusted)")
     except Exception as e:
-        logger.debug(f"  JS-based tile click failed: {e}")
+        logger.debug(f"  native locator click failed: {e}")
 
-    # Fallback strategies (only if the JS approach failed)
+    # ----- Strategy B: page.mouse.click at the tile's bounding box (trusted) -----
+    if not clicked:
+        box = _find_tile_box()
+        if box and box.get("ok"):
+            try:
+                x, y = float(box["x"]), float(box["y"])
+                # tiny jitter so we don't always click pixel-perfect center
+                jx = x + random.uniform(-2.0, 2.0)
+                jy = y + random.uniform(-2.0, 2.0)
+                page.mouse.move(jx, jy, steps=random.randint(8, 14))
+                time.sleep(random.uniform(0.05, 0.15))
+                page.mouse.click(jx, jy, delay=random.randint(40, 90))
+                clicked = True
+                logger.info(
+                    f"  -> mouse-clicked '{currency_label}' at ({jx:.1f},{jy:.1f}) "
+                    f"size={box['w']:.0f}x{box['h']:.0f} (trusted)"
+                )
+            except Exception as e:
+                logger.debug(f"  mouse.click at box failed: {e}")
+        else:
+            logger.debug(f"  could not resolve tile box: {box}")
+
+    # ----- Strategy C: legacy text/role fallbacks (still native, still trusted) -----
     if not clicked:
         strategies = [
-            ("styx toggler by name",
-             lambda: page.locator(
-                 ".wallet-currency-toggler",
-                 has=page.locator(f".wct-coin-name >> text='{currency_label}'"),
-             ).first.click(timeout=4000)),
             ("role=button exact",
              lambda: page.get_by_role("button", name=currency_label, exact=True)
                           .first.click(timeout=4000)),
             ("text exact",
              lambda: page.get_by_text(currency_label, exact=True).first
+                          .click(timeout=4000)),
+            ("text contains",
+             lambda: page.get_by_text(currency_label, exact=False).first
                           .click(timeout=4000)),
         ]
         for name, strat in strategies:
@@ -568,55 +735,55 @@ def do_topup(page, amount, currency_label="BNB (BEP20)",
         page.screenshot(path=os.path.join(debug_dir, "12_topup_tile_selected.png"),
                         full_page=True)
 
-    # 1b) VERIFY the right tile is actually selected, and RETRY if not.
-    def _is_selected():
-        try:
-            return page.evaluate(
-                """(label) => {
-                    const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
-                    const want = norm(label);
-                    const nameEls = Array.from(document.querySelectorAll('.wct-coin-name'));
-                    const target = nameEls.find(el => norm(el.textContent) === want);
-                    if (!target) return { ok: false, reason: 'tile not in DOM' };
-
-                    // Walk up to the toggler and inspect its classes / state.
-                    let cur = target;
-                    for (let i = 0; i < 8 && cur; i++) {
-                        const cls = (cur.className && cur.className.toString)
-                                       ? cur.className.toString() : '';
-                        if (/wallet-currency-toggler(?!__)/i.test(cls)) {
-                            const selected = /active|selected|checked|chosen|current|--is-/i.test(cls)
-                                || cur.getAttribute('aria-selected') === 'true'
-                                || cur.getAttribute('aria-pressed') === 'true';
-                            return { ok: true, selected: selected, cls: cls };
-                        }
-                        cur = cur.parentElement;
-                    }
-                    return { ok: false, reason: 'no toggler ancestor' };
-                }""",
-                currency_label,
-            )
-        except Exception as e:
-            logger.debug(f"selection check failed: {e}")
-            return None
-
+    # 1b) VERIFY the right tile is actually selected, and RETRY via mouse.click
     sel = _is_selected()
     logger.info(f"  selection check: {sel}")
-    if sel and sel.get("ok") and not sel.get("selected"):
-        logger.warning(f"'{currency_label}' click didn't latch - retrying once via direct Playwright click.")
+
+    def _retry_click():
+        # Use the bounding-box mouse click on retry too - it's the most
+        # reliable trusted-event path we have.
+        box = _find_tile_box()
+        if not (box and box.get("ok")):
+            return False
+        try:
+            x = float(box["x"]) + random.uniform(-2.0, 2.0)
+            y = float(box["y"]) + random.uniform(-2.0, 2.0)
+            page.mouse.move(x, y, steps=random.randint(8, 14))
+            time.sleep(random.uniform(0.05, 0.15))
+            page.mouse.click(x, y, delay=random.randint(40, 90))
+            return True
+        except Exception as e:
+            logger.debug(f"  retry mouse.click failed: {e}")
         try:
             page.locator(
                 ".wallet-currency-toggler",
                 has=page.locator(".wct-coin-name", has_text=currency_label),
             ).first.click(timeout=4000)
+            return True
+        except Exception as e:
+            logger.debug(f"  retry locator click failed: {e}")
+            return False
+
+    retries = 0
+    while sel and sel.get("ok") and not sel.get("selected") and retries < 2:
+        retries += 1
+        logger.warning(
+            f"'{currency_label}' click didn't latch (highlighted='{sel.get('highlighted')}') "
+            f"- retry {retries}/2 via trusted mouse click."
+        )
+        if _retry_click():
             time.sleep(random.uniform(0.6, 1.0))
             sel = _is_selected()
-            logger.info(f"  selection check (retry): {sel}")
-        except Exception as e:
-            logger.warning(f"retry click failed: {e}")
+            logger.info(f"  selection check (retry {retries}): {sel}")
+        else:
+            break
+
     if sel and sel.get("ok") and not sel.get("selected"):
-        logger.error(f"'{currency_label}' still not selected after retry. "
-                     f"Aborting top-up to avoid sending the wrong currency.")
+        logger.error(
+            f"'{currency_label}' still not selected after {retries} retries "
+            f"(page currently highlights '{sel.get('highlighted')}'). "
+            f"Aborting top-up to avoid sending the wrong currency."
+        )
         if debug_dir:
             page.screenshot(path=os.path.join(debug_dir, "12b_topup_wrong_tile.png"),
                             full_page=True)
