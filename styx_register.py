@@ -203,6 +203,41 @@ def process_registration(page, url, max_captcha_retries=3, debug_dir=None):
     page.goto(url, wait_until="domcontentloaded", timeout=60000)
     time.sleep(2)  # let any client-side JS settle
 
+    # ---- fingerprint self-check ---------------------------------------------
+    # If any of these come back "wrong", Cloudflare WILL flag us.
+    try:
+        fp = page.evaluate("""() => ({
+            webdriver: navigator.webdriver,
+            userAgent: navigator.userAgent,
+            platform:  navigator.platform,
+            languages: navigator.languages,
+            vendor:    navigator.vendor,
+            plugins:   navigator.plugins.length,
+            chrome:    typeof window.chrome,
+            permissions: typeof navigator.permissions,
+            webglVendor: (() => {
+                try {
+                    const c = document.createElement('canvas');
+                    const gl = c.getContext('webgl');
+                    const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+                    return gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL);
+                } catch(e) { return 'err:' + e.message; }
+            })(),
+        })""")
+        logger.info("--- browser fingerprint ---")
+        for k, v in fp.items():
+            tag = ""
+            if k == "webdriver" and v:
+                tag = "  <-- !! LEAK: should be false/undefined"
+            if k == "plugins" and v == 0:
+                tag = "  <-- !! LEAK: real Chrome has plugins"
+            if k == "chrome" and v == "undefined":
+                tag = "  <-- !! LEAK: real Chrome has window.chrome"
+            logger.info(f"  {k}: {v}{tag}")
+        logger.info("---------------------------")
+    except Exception as e:
+        logger.warning(f"fingerprint check failed: {e}")
+
     if debug_dir:
         page.screenshot(path=os.path.join(debug_dir, "01_landing.png"))
 
@@ -386,9 +421,33 @@ def main():
                              "'chrome-beta', 'msedge' or 'chromium'.")
     parser.add_argument("--profile",  default="/tmp/styx_profile",
                         help="Persistent user-data dir (keeps cookies between runs).")
+    parser.add_argument("--fresh-profile", action="store_true",
+                        help="Wipe the profile dir before starting (use if CF "
+                             "has already flagged a previous session).")
+    parser.add_argument("--use-real-chrome-profile", action="store_true",
+                        help="Use your REAL system Chrome profile (auto-detected). "
+                             "Cloudflare cannot distinguish this from you browsing "
+                             "manually. WARNING: close your Chrome before running.")
     parser.add_argument("--debug",    action="store_true",
                         help="Save screenshots + HTML dumps to ./debug_out/")
     args = parser.parse_args()
+
+    # Auto-detect real Chrome profile path if requested
+    if args.use_real_chrome_profile:
+        candidates = [
+            os.path.expanduser("~/Library/Application Support/Google/Chrome"),  # macOS
+            os.path.expanduser("~/.config/google-chrome"),                       # Linux
+            os.path.expanduser("~/AppData/Local/Google/Chrome/User Data"),       # Windows
+        ]
+        for cand in candidates:
+            if os.path.isdir(cand):
+                args.profile = cand
+                logger.info(f"Using REAL Chrome profile: {cand}")
+                logger.warning("Make sure ALL Chrome windows are closed before continuing.")
+                break
+        else:
+            logger.error("Could not find a real Chrome profile on this system.")
+            sys.exit(1)
 
     urls = []
     if args.url:
@@ -408,21 +467,38 @@ def main():
     logger.info(f"patchright in use: {USING_PATCHRIGHT}")
     logger.info(f"channel={args.channel}  headless={args.headless}  profile={args.profile}")
 
+    # Optionally wipe the profile (if a previous run got CF-flagged, its
+    # fingerprint cookies will still be there and re-flag us instantly).
+    if args.fresh_profile and os.path.isdir(args.profile) and not args.use_real_chrome_profile:
+        import shutil
+        logger.warning(f"Wiping profile dir: {args.profile}")
+        shutil.rmtree(args.profile, ignore_errors=True)
+
     results = []
     with sync_playwright() as p:
         # launch_persistent_context is critical: it uses an on-disk profile that
         # accumulates legitimate cookies/storage across runs — far less detectable
         # than a fresh ephemeral context every time.
+        #
+        # CRITICAL: with channel="chrome" we MUST NOT override user_agent / viewport /
+        # timezone_id / locale, because real Chrome already has perfectly consistent
+        # values for all of those. Overriding even one creates a mismatch between
+        # the JS-reported value and the build/OS/binary, which Cloudflare's worker
+        # cross-checks. Let Chrome be itself.
         launch_kwargs = dict(
             user_data_dir=args.profile,
             headless=args.headless,
             no_viewport=True,
             viewport=None,
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/130.0.0.0 Safari/537.36"),
-            locale="en-US",
-            timezone_id="America/New_York",
+            # Strip the automation flag that Chrome adds by default — this is what
+            # makes window.navigator.webdriver === true and triggers CF's bot rules.
+            ignore_default_args=["--enable-automation"],
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--no-default-browser-check",
+                "--no-first-run",
+            ],
         )
         # Channel selection — 'chrome' uses the real installed Chrome, which
         # is much harder to fingerprint than playwright's bundled chromium.
