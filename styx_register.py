@@ -471,7 +471,11 @@ def process_registration(page, url, max_captcha_retries=3, debug_dir=None):
     except Exception:
         pass
 
-    username = f"user_{generate_random_string(8)}"
+    # Username: must start with a letter (some sites reject leading digits),
+    # then 9-13 letters/digits. No underscores/dashes - Styx rejects them.
+    username = (random.choice(string.ascii_lowercase) +
+                ''.join(random.choices(string.ascii_lowercase + string.digits,
+                                       k=random.randint(9, 13))))
     password = generate_password()
     secret   = generate_random_string(12)
     logger.info(f"Generated credentials -> user={username}")
