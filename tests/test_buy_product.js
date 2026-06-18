@@ -128,48 +128,70 @@ const findProduct = ({label}) => {
         }
     }
     if (!row) return { ok: false, reason: 'no row ancestor' };
-    const cartRx = /(^|[\s_-])cart([\s_-]|$)|shopping[-_]?cart|add[-_]?to[-_]?cart|buy[-_]?now|basket/i;
-    const candidates = Array.from(row.querySelectorAll('svg, i, button, a, span, div'));
-    const isCarty = (el) => {
-        if (!el) return false;
+
+    // ----- New ranked-candidates heuristic (mirrors styx_register.py) -----
+    const includeRx = /(^|[\s_-])cart([\s_-]|$)|shopping[-_]?cart|add[-_]?to[-_]?cart|buy[-_]?now|basket|trolley/i;
+    const excludeRx = /mail|envelope|message|chat|letter|email|inbox|star|fav(ou)?rite|heart|like|bookmark|info|question|tooltip|share|copy|external[-_]?link|link[-_]?icon|bell|notification|delete|remove|trash|edit|menu|hamburger|search|filter|sort|user[-_]?avatar|profile/i;
+    const allEls = Array.from(row.querySelectorAll('button, a, svg, i, span, div'));
+    const idOf = (el) => {
         const cls = (el.className && el.className.toString) ? el.className.toString() : '';
-        if (cartRx.test(cls)) return true;
-        const al = el.getAttribute && (el.getAttribute('aria-label') || el.getAttribute('title') || el.getAttribute('data-tip') || el.getAttribute('data-tooltip') || '');
-        if (al && cartRx.test(al)) return true;
-        return false;
+        const al = el.getAttribute && (
+               el.getAttribute('aria-label') || el.getAttribute('title')
+            || el.getAttribute('data-tip')   || el.getAttribute('data-tooltip')
+            || el.getAttribute('data-original-title') || '');
+        return { cls, al, allText: cls + ' ' + (al || '') };
     };
-    let cart = candidates.find(el => {
-        if (!isCarty(el)) return false;
+    const isExcluded = (el) => excludeRx.test(idOf(el).allText);
+    const isIncluded = (el) => includeRx.test(idOf(el).allText);
+    const isClickableShape = (el) => {
         const r = el.getBoundingClientRect();
-        return r.width > 5 && r.height > 5;
-    });
-    if (cart) {
-        let up = cart;
+        return !(r.width < 8 || r.width > 100 || r.height < 8 || r.height > 100);
+    };
+    const toClickable = (el) => {
+        if (!el) return el;
+        let cur = el;
         for (let i = 0; i < 4; i++) {
-            if (!up || !up.parentElement) break;
-            const p = up.parentElement;
+            if (!cur || !cur.parentElement) break;
+            const p = cur.parentElement;
             const tag = p.tagName && p.tagName.toLowerCase();
-            if (tag === 'button' || tag === 'a' || (p.onclick != null)) { cart = p; break; }
-            up = p;
+            if (tag === 'button' || tag === 'a' || (p.onclick != null)) return p;
+            cur = p;
         }
+        return el;
+    };
+    let tier1 = allEls.filter(el => isClickableShape(el) && isIncluded(el) && !isExcluded(el));
+    let tier2 = [];
+    if (tier1.length === 0) {
+        tier2 = allEls.filter(el => {
+            if (!isClickableShape(el)) return false;
+            if (isExcluded(el)) return false;
+            const tag = el.tagName && el.tagName.toLowerCase();
+            if (tag === 'button' || tag === 'a') return true;
+            if (tag === 'svg' || tag === 'i') {
+                const wrap = toClickable(el);
+                return wrap && wrap !== el;
+            }
+            return false;
+        });
+        const seen = new Set();
+        tier2 = tier2.map(toClickable).filter(el => { if (seen.has(el)) return false; seen.add(el); return true; });
+        tier2.sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
+    } else {
+        const seen = new Set();
+        tier1 = tier1.map(toClickable).filter(el => { if (seen.has(el)) return false; seen.add(el); return true; });
     }
-    if (!cart) return { ok: false, reason: 'no cart icon' };
+    const ranked = [...tier1, ...tier2];
+    if (ranked.length === 0) return { ok: false, reason: 'no cart-like icon in row' };
+    const cart = ranked[0];
     const cr = cart.getBoundingClientRect();
     return { ok: true, x: cr.left + cr.width/2, y: cr.top + cr.height/2,
              tag: cart.tagName, cls: cart.className.toString(),
-             productText: norm(matched.textContent).slice(0, 80) };
+             productText: norm(matched.textContent).slice(0, 80),
+             tier: tier1.length > 0 ? 1 : 2,
+             candidatesCount: ranked.length };
 };
 
-console.log('--- Scenario A: full product name ---');
-// Debug dump first
-const _r3 = root._children[2];
-console.log('  Row #2 cls:', _r3.className.toString(), 'rect.w:', _r3.getBoundingClientRect().width);
-const _cands = _r3.querySelectorAll('svg, i, button, a, span, div');
-console.log('  Candidates in Firstmail row:');
-for (const c of _cands) {
-  const r = c.getBoundingClientRect();
-  console.log('   -', c.tagName, c._classes.join(' '), 'w=' + r.width, 'h=' + r.height);
-}
+console.log('--- Scenario A: full product name (cart in row) ---');
 const a = findProduct({label: 'Firstmail.ltd E-Mail Accounts'});
 console.log(JSON.stringify(a, null, 2));
 console.assert(a.ok === true, 'should find product');
@@ -177,7 +199,7 @@ console.assert(/cart/i.test(a.cls), 'should pick the cart-related element, not m
 console.assert(a.x > 430 && a.x < 480, 'click should land on cart icon (x=440-470)');
 console.log('PASS');
 
-console.log('\n--- Scenario B: truncated label (mimics what the user sees) ---');
+console.log('\n--- Scenario B: truncated label ---');
 const b = findProduct({label: 'Firstmail.ltd E-Mail Ac...'});
 console.log(JSON.stringify(b, null, 2));
 console.assert(b.ok === true, 'should find product even with truncated label');
@@ -188,5 +210,51 @@ const c = findProduct({label: 'Nonexistent Product XYZ'});
 console.log(JSON.stringify(c, null, 2));
 console.assert(c.ok === false, 'should report not-found');
 console.log('PASS');
+
+// REGRESSION: simulate the bug the user hit - mail icon comes BEFORE cart
+// in the row, and neither icon has a distinguishing class on the button
+// itself (only on the inner <i>). Make sure the heuristic still picks cart.
+console.log('\n--- Scenario D (regression): mail icon precedes cart, no class on button ---');
+function makeRowAmbiguous(name) {
+    const row = new El('div', { cls: 'product-row',
+        rect: { left: 0, top: 100, right: 1000, bottom: 160, width: 1000, height: 60 } });
+    row.appendChild(new El('span', { cls: 'product-name', text: name,
+        rect: { left: 100, top: 110, right: 400, bottom: 150, width: 300, height: 40 } }));
+    // info icon
+    const info = new El('button', { cls: 'icon-btn',
+        attrs: { 'aria-label': 'Info' },
+        rect: { left: 410, top: 118, right: 432, bottom: 142, width: 22, height: 24 } });
+    info.appendChild(new El('i', { cls: 'fa-info' }));
+    row.appendChild(info);
+    // mail icon comes FIRST (this is the bug scenario)
+    const mail = new El('button', { cls: 'icon-btn',
+        attrs: { 'aria-label': 'Write to seller' },
+        rect: { left: 440, top: 118, right: 462, bottom: 142, width: 22, height: 24 } });
+    mail.appendChild(new El('i', { cls: 'fa-envelope' }));
+    row.appendChild(mail);
+    // cart icon AFTER mail
+    const cart = new El('button', { cls: 'icon-btn',
+        attrs: { 'aria-label': 'Add to cart' },
+        rect: { left: 470, top: 118, right: 492, bottom: 142, width: 22, height: 24 } });
+    cart.appendChild(new El('i', { cls: 'fa-shopping-cart' }));
+    row.appendChild(cart);
+    // star
+    const star = new El('button', { cls: 'icon-btn',
+        attrs: { 'aria-label': 'Add to favorites' },
+        rect: { left: 500, top: 118, right: 522, bottom: 142, width: 22, height: 24 } });
+    star.appendChild(new El('i', { cls: 'fa-star' }));
+    row.appendChild(star);
+    return row;
+}
+// Replace the original Firstmail row with this ambiguous one.
+root._children[2] = makeRowAmbiguous('Firstmail.ltd E-Mail Accounts');
+root._children[2].parentElement = root;
+const d = findProduct({label: 'Firstmail.ltd E-Mail Accounts'});
+console.log(JSON.stringify(d, null, 2));
+console.assert(d.ok === true, 'should still find product');
+// Critical: should NOT pick the mail icon at x=451
+console.assert(d.x > 460 && d.x < 500,
+    `click should be on cart (x≈481) NOT on mail (x≈451) - got x=${d.x}`);
+console.log('PASS - mail icon correctly excluded; cart picked.');
 
 console.log('\nAll buy-product scenarios PASSED.');

@@ -13,6 +13,30 @@ Python automation using Playwright to register accounts on `https://styxmarket.s
 ## Implementation status (Feb 2026)
 
 ### Done
+- **Feb 2026 — Fixed mail/message icon being clicked instead of cart on
+  seller page.** User reported: after deposit confirmed, the script visited
+  the seller URL but clicked the "Write to seller" (envelope) icon instead
+  of the small cart icon in the product row. Root cause: the old `isCarty()`
+  helper had an SVG-path fallback that returned true for any SVG with a
+  long `d` attribute, so it matched the mail/star/info icons whenever the
+  real cart had no `cart`-related class.
+  Fix in `do_buy_product()`:
+    1. Removed the SVG-path fallback entirely (too noisy).
+    2. Added an EXCLUDE regex covering mail/envelope/message/star/heart/
+       info/share/bell/etc - those candidates can never win.
+    3. Strict INCLUDE regex on class/aria/title/data-tip/data-tooltip/
+       data-original-title.
+    4. Heuristic now returns a RANKED LIST of candidates (tier 1 = cart-
+       included; tier 2 = non-excluded clickable icons sorted left-to-
+       right) instead of a single guess.
+    5. Python caller reads the header cart-badge BEFORE clicking, then
+       clicks each candidate in turn and verifies via badge increment. If
+       the badge didn't go up, the wrong icon was clicked: Escape any
+       popup that opened, try the next candidate.
+  Regression covered by `/app/tests/test_buy_product.js` Scenario D - a
+  synthetic row where the mail icon comes BEFORE the cart and only the
+  inner `<i>` has a distinguishing class. Heuristic correctly skips mail
+  and picks cart. 4/4 scenarios PASS.
 - **Feb 2026 — Fixed false-negative on TOP UP BALANCE click.** User reported:
   funds arrived (green checkmark visible) but the script logged "Could not
   click TOP UP BALANCE" and skipped the deposit-wait + auto-buy. Root cause:

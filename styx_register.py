@@ -1348,58 +1348,105 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None):
                                 productText: norm(matched.textContent).slice(0, 80) };
 
             // 3) Find a cart-shaped element INSIDE this row, not the header.
-            //    Try class names and aria/title/SVG path heuristics.
-            const cartRx = /(^|[\\s_-])cart([\\s_-]|$)|shopping[-_]?cart|add[-_]?to[-_]?cart|buy[-_]?now|basket/i;
-            const candidates = Array.from(row.querySelectorAll(
-                'svg, i, button, a, span, div'));
-            const isCarty = (el) => {
-                if (!el) return false;
+            //
+            // KEY LESSON from a previous run: the mail/envelope ("Write
+            // seller") icon sometimes won over the cart because the previous
+            // SVG-path fallback was too permissive (it returned true for any
+            // SVG with a long `d` attribute, which matches every icon).
+            // The new logic:
+            //   - EXCLUDE obvious non-cart icons (mail/envelope/message/star/
+            //     heart/info/share/copy/external/link/bell/notification).
+            //   - INCLUDE cart-related tokens explicitly.
+            //   - Returns a RANKED LIST of candidates; the Python caller
+            //     clicks each in turn and verifies by header-cart-badge
+            //     increment, falling through if the wrong one was picked.
+            const includeRx = /(^|[\\s_-])cart([\\s_-]|$)|shopping[-_]?cart|add[-_]?to[-_]?cart|buy[-_]?now|basket|trolley/i;
+            const excludeRx = /mail|envelope|message|chat|letter|email|inbox|star|fav(ou)?rite|heart|like|bookmark|info|question|tooltip|share|copy|external[-_]?link|link[-_]?icon|bell|notification|delete|remove|trash|edit|menu|hamburger|search|filter|sort|user[-_]?avatar|profile/i;
+
+            const allEls = Array.from(row.querySelectorAll('button, a, svg, i, span, div'));
+            const idOf = (el) => {
                 const cls = (el.className && el.className.toString)
                                 ? el.className.toString() : '';
-                if (cartRx.test(cls)) return true;
                 const al = el.getAttribute && (
-                    el.getAttribute('aria-label') || el.getAttribute('title') ||
-                    el.getAttribute('data-tip')   || el.getAttribute('data-tooltip') || '');
-                if (al && cartRx.test(al)) return true;
-                // SVG icon: look for cart-ish path data
-                if (el.tagName === 'SVG' || el.tagName === 'svg') {
-                    const paths = el.querySelectorAll('path');
-                    for (const p of paths) {
-                        const d = p.getAttribute('d') || '';
-                        // crude: cart icons often start with M2-M3 (moving to
-                        // the left of viewBox) and have a width >20 units.
-                        if (d.length > 40 && /M[0-9]/.test(d)) {
-                            // accept; many false positives but we'll filter
-                            // by position below.
-                            return true;
-                        }
-                    }
-                }
-                return false;
+                       el.getAttribute('aria-label')
+                    || el.getAttribute('title')
+                    || el.getAttribute('data-tip')
+                    || el.getAttribute('data-tooltip')
+                    || el.getAttribute('data-original-title')
+                    || '');
+                return { cls, al, allText: cls + ' ' + (al || '') };
             };
-            // Filter: must be visible and inside row.
-            let cart = candidates.find(el => {
-                if (!isCarty(el)) return false;
+            const isExcluded = (el) => excludeRx.test(idOf(el).allText);
+            const isIncluded = (el) => includeRx.test(idOf(el).allText);
+            const isClickableShape = (el) => {
                 const r = el.getBoundingClientRect();
-                return r.width > 5 && r.height > 5;
-            });
+                if (r.width < 8 || r.width > 100 || r.height < 8 || r.height > 100) return false;
+                return true;
+            };
 
-            // If the matched element is an inner SVG/icon, walk up to the
-            // button/anchor parent which is more reliably clickable.
-            if (cart) {
-                let up = cart;
+            // Walk-up helper: when we found an SVG/inner icon, prefer its
+            // closest <button>/<a> ancestor for a more reliable click.
+            const toClickable = (el) => {
+                if (!el) return el;
+                let cur = el;
                 for (let i = 0; i < 4; i++) {
-                    if (!up || !up.parentElement) break;
-                    const p = up.parentElement;
+                    if (!cur || !cur.parentElement) break;
+                    const p = cur.parentElement;
                     const tag = p.tagName && p.tagName.toLowerCase();
                     if (tag === 'button' || tag === 'a' || (p.onclick != null)) {
-                        cart = p; break;
+                        return p;
                     }
-                    up = p;
+                    cur = p;
                 }
+                return el;
+            };
+
+            // Tier 1: explicit cart matches that are NOT excluded.
+            let tier1 = allEls.filter(el =>
+                isClickableShape(el) && isIncluded(el) && !isExcluded(el));
+
+            // Tier 2: non-excluded, icon-shaped clickables (last-resort -
+            // pick by position, leftmost wins). Used only if tier 1 empty.
+            let tier2 = [];
+            if (tier1.length === 0) {
+                tier2 = allEls.filter(el => {
+                    if (!isClickableShape(el)) return false;
+                    if (isExcluded(el)) return false;
+                    const tag = el.tagName && el.tagName.toLowerCase();
+                    // Must look like an icon button: clickable wrapper, OR an
+                    // svg/i with a clickable ancestor in the row.
+                    if (tag === 'button' || tag === 'a') return true;
+                    if (tag === 'svg' || tag === 'i') {
+                        const wrap = toClickable(el);
+                        return wrap && wrap !== el;
+                    }
+                    return false;
+                });
+                // Dedupe by clickable wrapper so we don't list both the svg
+                // and its parent button.
+                const seen = new Set();
+                tier2 = tier2.map(toClickable).filter(el => {
+                    if (seen.has(el)) return false;
+                    seen.add(el);
+                    return true;
+                });
+                // Sort left-to-right (cart is the first icon after the
+                // product name on Styx).
+                tier2.sort((a, b) => a.getBoundingClientRect().left
+                                   - b.getBoundingClientRect().left);
+            } else {
+                // Also dedupe tier1 by clickable wrapper.
+                const seen = new Set();
+                tier1 = tier1.map(toClickable).filter(el => {
+                    if (seen.has(el)) return false;
+                    seen.add(el);
+                    return true;
+                });
             }
 
-            if (!cart) {
+            const ranked = [...tier1, ...tier2];
+
+            if (ranked.length === 0) {
                 // Diagnostic dump: what's in this row?
                 const inv = Array.from(row.querySelectorAll('*'))
                     .filter(el => {
@@ -1407,30 +1454,47 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None):
                                         ? el.className.toString() : '';
                         return cls && cls.length < 100;
                     })
-                    .slice(0, 25)
+                    .slice(0, 30)
                     .map(el => ({
                         tag: el.tagName,
                         cls: el.className.toString().slice(0, 80),
                         aria: el.getAttribute && el.getAttribute('aria-label'),
                         title: el.getAttribute && el.getAttribute('title'),
+                        tip: el.getAttribute && (el.getAttribute('data-tip')
+                                              || el.getAttribute('data-tooltip')
+                                              || el.getAttribute('data-original-title')),
                     }));
-                return { ok: false, reason: 'no cart icon in row',
+                return { ok: false, reason: 'no cart-like icon in row',
                          productText: norm(matched.textContent).slice(0, 80),
                          rowCls: row.className.toString().slice(0, 100),
                          rowItems: inv };
             }
 
-            try { cart.scrollIntoView({block: 'center', inline: 'center'}); } catch (e) {}
-            const cr = cart.getBoundingClientRect();
+            try { ranked[0].scrollIntoView({block: 'center', inline: 'center'}); } catch (e) {}
+
+            // Return the ranked list of candidates with their boxes & ids.
+            // The Python caller will click them in order and verify via
+            // header-cart-badge increment.
+            const candidatesOut = ranked.slice(0, 6).map(el => {
+                const r = el.getBoundingClientRect();
+                const id = idOf(el);
+                return {
+                    x: r.left + r.width / 2,
+                    y: r.top + r.height / 2,
+                    w: r.width, h: r.height,
+                    tag: el.tagName,
+                    cls: id.cls.slice(0, 100),
+                    aria: (id.al || '').slice(0, 80),
+                };
+            });
+            const top = candidatesOut[0];
             return {
                 ok: true,
-                x: cr.left + cr.width / 2,
-                y: cr.top + cr.height / 2,
-                w: cr.width, h: cr.height,
-                tag: cart.tagName,
-                cls: (cart.className && cart.className.toString)
-                        ? cart.className.toString().slice(0, 100) : '',
+                x: top.x, y: top.y, w: top.w, h: top.h,
+                tag: top.tag, cls: top.cls, aria: top.aria,
+                tier: tier1.length > 0 ? 1 : 2,
                 productText: norm(matched.textContent).slice(0, 80),
+                candidates: candidatesOut,
             };
         }""",
         {"label": product_name},
@@ -1443,19 +1507,155 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None):
                             full_page=True)
         return False
 
-    # Click the row-cart icon via trusted page.mouse.click at the bbox center.
-    try:
-        jx = float(found["x"]) + random.uniform(-2.0, 2.0)
-        jy = float(found["y"]) + random.uniform(-2.0, 2.0)
-        page.mouse.move(jx, jy, steps=random.randint(8, 14))
-        time.sleep(random.uniform(0.1, 0.25))
-        page.mouse.click(jx, jy, delay=random.randint(40, 90))
-        logger.info(f"  -> clicked row cart icon for '{product_name}' at ({jx:.1f},{jy:.1f})")
-    except Exception as e:
-        logger.error(f"  failed to click row cart icon: {e}")
+    # Read header-cart badge BEFORE clicking, so we can detect whether the
+    # click actually added an item (vs clicked the wrong icon).
+    def _read_cart_badge():
+        try:
+            return page.evaluate(
+                """() => {
+                    // Find a cart-like icon in the header area and look at
+                    // its neighbouring number/badge.
+                    const vw = window.innerWidth;
+                    const cartRx = /(^|[\\s_-])cart([\\s_-]|$)|shopping[-_]?cart|basket|header-?cart/i;
+                    const all = Array.from(document.querySelectorAll('a, button, span, div, i, svg'));
+                    const headerCart = all.find(el => {
+                        const r = el.getBoundingClientRect();
+                        if (r.top > 140 || r.left < vw * 0.4) return false;
+                        const cls = (el.className && el.className.toString) ? el.className.toString() : '';
+                        const al = el.getAttribute && (el.getAttribute('aria-label') || el.getAttribute('title') || '') || '';
+                        return cartRx.test(cls) || (al && cartRx.test(al));
+                    });
+                    if (!headerCart) return { ok: false, count: null };
+
+                    // Find badge: a child / sibling number within the cart's
+                    // bounding box, or a [class*="badge"] / [class*="count"]
+                    // / superscript span nearby.
+                    const parseInt10 = s => {
+                        const m = (s || '').match(/\\d+/);
+                        return m ? parseInt(m[0], 10) : null;
+                    };
+                    // 1) descendants
+                    const desc = Array.from(headerCart.querySelectorAll('*'));
+                    for (const d of desc) {
+                        const cls = (d.className && d.className.toString) ? d.className.toString() : '';
+                        if (/badge|count|cart[-_]?(num|count|amount)/i.test(cls)) {
+                            const n = parseInt10(d.textContent);
+                            if (n !== null) return { ok: true, count: n, src: 'desc-class' };
+                        }
+                    }
+                    // 2) any descendant pure-number text
+                    for (const d of desc) {
+                        const own = (d.textContent || '').trim();
+                        if (/^\\s*\\d+\\s*$/.test(own)) {
+                            const n = parseInt10(own);
+                            if (n !== null && n < 100) return { ok: true, count: n, src: 'desc-num' };
+                        }
+                    }
+                    // 3) sibling badge (badge floats next to the cart icon)
+                    const parent = headerCart.parentElement;
+                    if (parent) {
+                        const sibDesc = Array.from(parent.querySelectorAll('*'));
+                        for (const d of sibDesc) {
+                            const cls = (d.className && d.className.toString) ? d.className.toString() : '';
+                            if (/badge|count/i.test(cls)) {
+                                const n = parseInt10(d.textContent);
+                                if (n !== null) return { ok: true, count: n, src: 'sib-class' };
+                            }
+                        }
+                    }
+                    // No badge visible -> assume count is 0.
+                    return { ok: true, count: 0, src: 'no-badge' };
+                }"""
+            )
+        except Exception as e:
+            logger.debug(f"  read cart badge failed: {e}")
+            return None
+
+    before_badge = _read_cart_badge()
+    before_n = (before_badge or {}).get("count") if before_badge else None
+    logger.info(f"  header cart badge BEFORE click: {before_badge}")
+
+    # Click candidates in ranked order until the header cart badge
+    # increments (or the cart popup opens). This is the critical fix for
+    # the bug where the mail/message icon was clicked instead of the cart.
+    candidates = found.get("candidates") or [
+        {"x": found.get("x"), "y": found.get("y"),
+         "tag": found.get("tag"), "cls": found.get("cls"),
+         "aria": found.get("aria"), "w": found.get("w"), "h": found.get("h")}
+    ]
+    logger.info(f"  ranked candidates for '{product_name}': {candidates}")
+
+    add_ok = False
+    for idx, cand in enumerate(candidates, 1):
+        try:
+            jx = float(cand["x"]) + random.uniform(-2.0, 2.0)
+            jy = float(cand["y"]) + random.uniform(-2.0, 2.0)
+            page.mouse.move(jx, jy, steps=random.randint(8, 14))
+            time.sleep(random.uniform(0.1, 0.25))
+            page.mouse.click(jx, jy, delay=random.randint(40, 90))
+            logger.info(
+                f"  -> tried candidate #{idx} at ({jx:.1f},{jy:.1f}) "
+                f"tag={cand.get('tag')} cls='{(cand.get('cls') or '')[:60]}' "
+                f"aria='{(cand.get('aria') or '')[:40]}'"
+            )
+        except Exception as e:
+            logger.debug(f"  click on candidate #{idx} failed: {e}")
+            continue
+
+        # Give the page a moment to update the badge / open a popup.
+        time.sleep(random.uniform(0.8, 1.4))
+        after_badge = _read_cart_badge()
+        after_n = (after_badge or {}).get("count") if after_badge else None
+        logger.info(f"  header cart badge AFTER candidate #{idx}: {after_badge}")
+
+        # Success criterion: badge count went UP. If we couldn't read a
+        # numeric count before/after but the badge now exists with count>=1
+        # while it was 0 before, that's also a win.
+        added = False
+        if (isinstance(after_n, int) and isinstance(before_n, int)
+                and after_n > before_n):
+            added = True
+        elif (after_n is not None and after_n >= 1
+              and (before_n is None or before_n == 0)):
+            added = True
+
+        if added:
+            add_ok = True
+            logger.success(
+                f"  Item added to cart (badge {before_n} -> {after_n}) via "
+                f"candidate #{idx} tag={cand.get('tag')} "
+                f"cls='{(cand.get('cls') or '')[:60]}'"
+            )
+            # Update for any subsequent comparisons (e.g. if user runs the
+            # buy flow again).
+            before_n = after_n
+            break
+
+        # No increment -> wrong icon was likely clicked. Try the next one.
+        # First, dismiss any popup/modal that may have opened (e.g. the
+        # "Write to seller" dialog if we clicked the mail icon).
+        try:
+            page.keyboard.press("Escape")
+            time.sleep(0.3)
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        logger.info(
+            f"  candidate #{idx} did not increment cart badge "
+            f"(before={before_n}, after={after_n}); trying next candidate."
+        )
+
+    if not add_ok:
+        logger.error(
+            f"Tried {len(candidates)} candidate(s) but none incremented "
+            f"the header cart badge. Cannot reliably add '{product_name}' "
+            f"to cart."
+        )
+        if debug_dir:
+            page.screenshot(path=os.path.join(debug_dir, "22b_no_add_to_cart.png"),
+                            full_page=True)
         return False
 
-    time.sleep(random.uniform(0.8, 1.4))
     if debug_dir:
         page.screenshot(path=os.path.join(debug_dir, "22_added_to_cart.png"),
                         full_page=True)
