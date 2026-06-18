@@ -128,27 +128,24 @@ def process_registration(page, url, max_captcha_retries=3):
     
     logger.info(f"Generated - User: {username}")
     
-    # Scope our locators strictly to the sign-up form
-    form = page.locator("div.sign-up-form__body, div.sign-up__form").first
-    
-    # Force fill on exact name attributes to bypass hidden/un-interactable states
     try:
-        logger.info("Attempting forced fill...")
-        form.locator("input[name='username']").first.fill(username, force=True, timeout=5000)
-        form.locator("input[name='password']").first.fill(password, force=True, timeout=5000)
+        logger.info("Attempting forced fill with global locators...")
+        # Mobile/hidden navbars often have the same inputs. The sign-up ones are usually the LAST in the DOM.
+        page.locator("input[name='username']").last.fill(username, force=True, timeout=5000)
+        page.locator("input[name='password']").last.fill(password, force=True, timeout=5000)
         
         # Determine secret code input
-        secret_locator = form.locator("input[name='secret_code'], input[name='secret'], input[name='pin']")
+        secret_locator = page.locator("input[name='secret_code'], input[name='secret'], input[name='pin']")
         if secret_locator.count() > 0:
-            secret_locator.first.fill(secret, force=True, timeout=5000)
+            secret_locator.last.fill(secret, force=True, timeout=5000)
         else:
-            # Fallback to the third text/password input
-            form.locator("input[type='text'], input[type='password']").nth(2).fill(secret, force=True, timeout=5000)
+            # Fallback to the last password input on the page
+            page.locator("input[type='password']").last.fill(secret, force=True, timeout=5000)
             
     except Exception as e:
         logger.warning(f"Fill failed. Error: {e}")
         
-    page.locator("button:has-text('Sign up'), button[type='submit'], div.sign-up__form button").first.click(force=True)
+    page.locator("button:has-text('Sign up'), button[type='submit'], .sign-up__form button").last.click(force=True, timeout=5000)
     logger.info("Submitted Registration Form.")
 
     # 3. Time Verification / Clock CAPTCHA
