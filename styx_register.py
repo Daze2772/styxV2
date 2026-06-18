@@ -361,6 +361,52 @@ def is_cloudflare_blocked(page):
     return False
 
 
+# ---------- session reset ------------------------------------------------------
+def _reset_site_session(page, url):
+    """
+    Clear cookies + localStorage/sessionStorage for the target site so each run
+    looks like a fresh first-time visitor to Styx, while keeping the underlying
+    Chrome profile (history, plugins, accumulated TLS reputation) intact for
+    Cloudflare trust.
+    """
+    from urllib.parse import urlparse
+    host = urlparse(url).hostname or ""
+    ctx = page.context
+
+    # 1) Cookies - drop anything whose domain matches our target host.
+    try:
+        all_cookies = ctx.cookies()
+        keep, drop = [], []
+        for c in all_cookies:
+            dom = (c.get("domain") or "").lstrip(".")
+            if dom and (dom == host or host.endswith("." + dom) or dom.endswith(host)):
+                drop.append(c)
+            else:
+                keep.append(c)
+        ctx.clear_cookies()
+        if keep:
+            ctx.add_cookies(keep)
+        logger.info(f"Session reset: dropped {len(drop)} cookie(s) for {host}, "
+                    f"kept {len(keep)}.")
+    except Exception as e:
+        logger.debug(f"cookie reset failed: {e}")
+
+    # 2) localStorage / sessionStorage - needs an active page on the origin.
+    # Best-effort: visit the site root first, clear, then continue.
+    try:
+        origin = f"{urlparse(url).scheme}://{host}"
+        page.goto(origin, wait_until="domcontentloaded", timeout=30000)
+        page.evaluate("""() => {
+            try { localStorage.clear(); } catch(e) {}
+            try { sessionStorage.clear(); } catch(e) {}
+            try { indexedDB.databases && indexedDB.databases()
+                  .then(dbs => dbs.forEach(db => indexedDB.deleteDatabase(db.name))); } catch(e) {}
+        }""")
+        logger.info(f"Cleared localStorage/sessionStorage for {origin}.")
+    except Exception as e:
+        logger.debug(f"storage reset failed (non-fatal): {e}")
+
+
 # ---------- post-registration: wallet top-up ----------------------------------
 def do_topup(page, amount, currency_label="BNB (BEP20)",
              base_url="https://styxmarket.si", debug_dir=None):
@@ -482,7 +528,10 @@ def do_topup(page, amount, currency_label="BNB (BEP20)",
 # ---------- registration flow --------------------------------------------------
 def process_registration(page, url, max_captcha_retries=3, debug_dir=None,
                          topup_amount=0, topup_currency="BNB (BEP20)",
-                         keep_open=False):
+                         keep_open=False, keep_session=False):
+    if not keep_session:
+        _reset_site_session(page, url)
+
     logger.info(f"Navigating to {url}")
     page.goto(url, wait_until="domcontentloaded", timeout=60000)
     time.sleep(2)  # let any client-side JS settle
@@ -938,6 +987,7 @@ def _run_with_patchright(args, urls, debug_dir, results):
                         topup_amount=args.topup,
                         topup_currency=args.topup_currency,
                         keep_open=args.keep_open,
+                        keep_session=args.keep_session,
                     )
                     if result:
                         results.append(result)
@@ -995,6 +1045,7 @@ def _run_with_camoufox(args, urls, debug_dir, results):
                         topup_amount=args.topup,
                         topup_currency=args.topup_currency,
                         keep_open=args.keep_open,
+                        keep_session=args.keep_session,
                     )
                     if result:
                         results.append(result)
@@ -1059,6 +1110,14 @@ def main():
                         help="After all actions complete, leave the browser open "
                              "until you manually close the tab. The script blocks "
                              "until the page is closed.")
+    parser.add_argument("--keep-session", action="store_true",
+                        help="Skip the per-run cookie/localStorage reset for the "
+                             "target site. By default the script clears Styx "
+                             "cookies + storage on every run so each registration "
+                             "sees a fresh visitor (the Chrome profile itself is "
+                             "still reused to keep Cloudflare trust). Use this "
+                             "flag if you instead want to resume the previous "
+                             "logged-in session.")
     args = parser.parse_args()
 
     # Auto-detect real Chrome profile path if requested
