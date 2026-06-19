@@ -1024,27 +1024,83 @@ def do_topup(page, amount, currency_label="BNB (BEP20)",
         return True
     start_url = (pre_state or {}).get("urlPath")
 
+    # Pre-flight: scroll the TOP UP BALANCE button into view BEFORE any
+    # click strategy runs. The user reported the button is off-screen on
+    # their viewport - locator.click() auto-scrolls, but the diagnostic
+    # log + a manual screenshot are taken before that, so this scroll keeps
+    # the debug artifacts useful and reduces the chance of any strategy
+    # missing because of viewport math.
+    try:
+        page.evaluate(
+            """() => {
+                const tgt = document.querySelector('[data-i18n="wallet.top_up_btn"]')
+                          || document.querySelector('form > div > button')
+                          || document.querySelector('form button');
+                if (tgt) tgt.scrollIntoView({behavior: 'instant', block: 'center'});
+            }"""
+        )
+        time.sleep(0.5)
+    except Exception as e:
+        logger.debug(f"  pre-flight scroll-into-view failed: {e}")
+
     # Strategies, in order. We deliberately do NOT use
     # `button[type='submit'].last` because Styx has a hidden refund-modal
     # submit button that gets picked first and causes a false "could not
     # click" failure. We constrain to visible buttons only.
+    #
+    # FIELD-VERIFIED HTML (from user 2026-06-19):
+    #   <span data-i18n="wallet.top_up_btn">Top up balance</span>
+    #   inside  form > div > button > span
+    # The button is below the fold on shorter viewports, so EVERY strategy
+    # must scroll into view first (Playwright's locator.click() does this
+    # automatically, but page.mouse.click() does NOT - it clicks at
+    # viewport coords, and if the button is below the viewport, it misses).
+    def _scroll_then_click(selector, force=False):
+        """Return a thunk that scrolls the selector into view then clicks."""
+        def _do():
+            loc = page.locator(selector).first
+            try:
+                loc.scroll_into_view_if_needed(timeout=3000)
+                time.sleep(0.3)
+            except Exception:
+                pass
+            loc.click(timeout=5000, force=force)
+        return _do
+
     btn_strategies = [
+        # Strategy 0: locale-stable. data-i18n is Vue-i18n's identifier and
+        # does NOT change with language; it survives any future locale
+        # changes / wording tweaks.
+        ("data-i18n=wallet.top_up_btn (button parent)",
+         _scroll_then_click('button:has([data-i18n="wallet.top_up_btn"])')),
+        ("data-i18n=wallet.top_up_btn (span itself)",
+         _scroll_then_click('[data-i18n="wallet.top_up_btn"]')),
+        # Strategy 1: literal CSS path from the user's element inspector.
+        # On /wallet/top-up/ this form contains EXACTLY ONE button.
+        ("form > div > button (CSS path)",
+         _scroll_then_click('form > div > button')),
+        ("form button:visible",
+         _scroll_then_click('form button:visible')),
+        # Strategies 2-7: text/role matchers (kept as fallback in case the
+        # data-i18n attr ever disappears).
         ("role=TOP UP BALANCE",
          lambda: page.get_by_role("button", name="TOP UP BALANCE").first.click(timeout=5000)),
         ("role=Top up balance",
          lambda: page.get_by_role("button", name="Top up balance").first.click(timeout=5000)),
         ("text=TOP UP BALANCE",
-         lambda: page.locator("button:has-text('TOP UP BALANCE'):visible").first.click(timeout=5000)),
+         _scroll_then_click("button:has-text('TOP UP BALANCE'):visible")),
         ("text=Top up balance",
-         lambda: page.locator("button:has-text('Top up balance'):visible").first.click(timeout=5000)),
+         _scroll_then_click("button:has-text('Top up balance'):visible")),
         ("text=Top up (visible)",
-         lambda: page.locator("button:has-text('Top up'):visible").last.click(timeout=5000)),
+         _scroll_then_click("button:has-text('Top up'):visible")),
         # Force-click variants - if Playwright thinks the element isn't
         # actionable but we know it's the one we want, force the click.
+        ("data-i18n (force)",
+         _scroll_then_click('button:has([data-i18n="wallet.top_up_btn"])', force=True)),
         ("text=TOP UP BALANCE (force)",
-         lambda: page.locator("button:has-text('TOP UP BALANCE')").first.click(timeout=5000, force=True)),
+         _scroll_then_click("button:has-text('TOP UP BALANCE')", force=True)),
         ("text=Top up (force)",
-         lambda: page.locator("button:has-text('Top up')").last.click(timeout=5000, force=True)),
+         _scroll_then_click("button:has-text('Top up')", force=True)),
     ]
 
     # ---- Diagnostic: enumerate every visible button-like element so the
@@ -1187,6 +1243,34 @@ def do_topup(page, amount, currency_label="BNB (BEP20)",
                     f"  clicking best candidate <{top['tag']}> "
                     f"'{top['txt']}' at ({top['x']:.0f},{top['y']:.0f}) "
                     f"score={top['score']:.0f}")
+                # Scroll the best candidate into view BEFORE mouse.click so
+                # we hit the right viewport coordinates. mouse.click does NOT
+                # auto-scroll the way Playwright's locator.click does.
+                try:
+                    rescroll = page.evaluate(
+                        """(txt) => {
+                            const rx = /(top.?up|deposit|pay|submit|continue|confirm)/i;
+                            const els = document.querySelectorAll('button, [role="button"], input[type="submit"], a, div, span');
+                            for (const el of els) {
+                                try {
+                                    const t = (el.innerText || el.textContent || '').trim();
+                                    if (t === txt || (t && txt.includes(t.slice(0,20)))) {
+                                        el.scrollIntoView({behavior: 'instant', block: 'center'});
+                                        const r = el.getBoundingClientRect();
+                                        return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+                                    }
+                                } catch (e) {}
+                            }
+                            return null;
+                        }""", top["txt"]
+                    )
+                    if rescroll and rescroll.get("x") is not None:
+                        time.sleep(0.4)
+                        top["x"], top["y"] = rescroll["x"], rescroll["y"]
+                        logger.info(
+                            f"  scrolled into view; new coords ({top['x']:.0f},{top['y']:.0f})")
+                except Exception as e:
+                    logger.debug(f"  scroll-before-click failed: {e}")
                 try:
                     page.mouse.click(float(top["x"]), float(top["y"]),
                                      delay=random.randint(40, 90))
@@ -2014,7 +2098,8 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None,
         logger.warning(
             "Quick verification slider (or login wall) detected on seller "
             "page. Avoiding the 'Continue' click (which kills the session) "
-            "and attempting alternative recovery."
+            "and falling back to the marketplace 'buy any cheap product' "
+            "flow per user spec."
         )
         if debug_dir:
             try:
@@ -2025,21 +2110,34 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None,
             except Exception:
                 pass
 
-        catalog_url = "https://www.styxmarket.si/shop/catalog/?vue=true"
         recovered = False
 
-        # Strategy 1: go_back to the deposit-success page, scroll to top,
-        # click the big Styx logo to warm-navigate to the homepage, then
-        # goto seller_url.
+        # ----- MARKETPLACE FALLBACK ------------------------------------------
+        # Per user 2026-06-19: when the slider blocks the seller page, give
+        # up on the user-requested product. Instead:
+        #   1. go_back to the deposit-success page (which is still logged in
+        #      and not behind the slider).
+        #   2. Click the big Styx logo to warm-navigate to the homepage,
+        #      which IS the marketplace.
+        #   3. Type "1" into the "$ Max" filter input on the left sidebar.
+        #   4. Wait for the product list to filter (max $1 products only).
+        #   5. Pick the first product whose visible price is <= $0.50 (or
+        #      <= $1 as a fallback - the $1 cap is already enforced by step
+        #      3 so anything in the filtered list qualifies as "cheap").
+        #   6. Override `product_name` with the picked product's visible
+        #      label, set recovered=True, and fall through to the existing
+        #      find-row + click-cart + open-cart + buy + confirm code.
         logger.info(
-            "  recovery 1: page.go_back() -> scroll top -> click Styx "
-            "logo -> goto seller_url.")
+            "  marketplace fallback: go_back -> click logo -> filter $Max=1 "
+            "-> pick cheap product -> continue with existing buy flow."
+        )
+
+        # Step 1: go_back to deposit success page.
         try:
             page.go_back(wait_until="domcontentloaded", timeout=15000)
             time.sleep(random.uniform(1.5, 2.5))
         except Exception as e:
             logger.debug(f"  go_back failed: {e}")
-        # Scroll to the very top so the header (and the logo) is in view.
         try:
             page.evaluate(
                 "() => window.scrollTo({ top: 0, behavior: 'instant' })")
@@ -2057,9 +2155,24 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None,
                 )
             except Exception:
                 pass
-        # Click the big Styx logo -> homepage.
+
+        # Step 2: click the Styx logo -> homepage (marketplace).
         logo_ok = _click_styx_logo()
-        if debug_dir and logo_ok:
+        if not logo_ok:
+            # Fallback: hard-navigate to the homepage.
+            logger.warning(
+                "  logo click failed; hard-navigating to the homepage.")
+            try:
+                page.goto("https://www.styxmarket.si/",
+                          wait_until="domcontentloaded", timeout=30000)
+                time.sleep(random.uniform(1.5, 2.5))
+            except Exception as e:
+                logger.debug(f"  hard goto homepage failed: {e}")
+        try:
+            page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
+        if debug_dir:
             try:
                 page.screenshot(
                     path=os.path.join(debug_dir, "19b_after_logo_click.png"),
@@ -2067,74 +2180,257 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None,
                 )
             except Exception:
                 pass
-        # Now navigate (paste + visit) the seller URL.
-        try:
-            page.goto(seller_url, wait_until="domcontentloaded", timeout=45000)
-            try:
-                page.wait_for_load_state("networkidle", timeout=10000)
-            except Exception:
-                pass
-            time.sleep(random.uniform(1.5, 2.5))
-        except Exception as e:
-            logger.debug(f"  goto seller_url after logo click failed: {e}")
-        if not _slider_or_login():
-            logger.success(
-                f"  go_back+logo recovery succeeded. URL: {page.url}")
-            recovered = True
-        else:
-            logger.warning(
-                "  go_back+logo recovery did not clear the slider/login wall."
+        # Bail if the slider is STILL up - logo click didn't help.
+        if _slider_or_login():
+            logger.error(
+                "  marketplace fallback: slider/login STILL showing after "
+                "logo click. Aborting recovery."
             )
             if debug_dir:
                 try:
                     page.screenshot(
-                        path=os.path.join(debug_dir, "19c_after_seller_goto.png"),
+                        path=os.path.join(debug_dir, "19_slider_still_up.png"),
                         full_page=True,
                     )
                 except Exception:
                     pass
+            return False
 
-        # Strategy 2: warm via the public catalog page, then re-goto seller_url.
-        if not recovered:
-            logger.info(
-                f"  recovery 2: goto catalog {catalog_url} -> re-goto seller_url."
-            )
+        # Step 3: type "1" into the "$ Max" filter input.
+        # The filter sidebar shows two inputs side by side: $ Min and $ Max.
+        # We want the SECOND one. We try a strict positional locator first
+        # (sibling of a "$ Min" input, or the input directly after one with
+        # placeholder containing 'Min'), and fall back to any visible input
+        # whose placeholder contains 'Max' or which sits below a "PRICE"
+        # label.
+        logger.info("  applying $ Max = 1 filter...")
+        max_filter_applied = page.evaluate(
+            """() => {
+                const norm = s => (s || '').toLowerCase();
+                // Find every visible input.
+                const inputs = Array.from(document.querySelectorAll('input'));
+                const visible = inputs.filter(el => {
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 10 || r.height < 10) return false;
+                    const cs = getComputedStyle(el);
+                    return cs.visibility !== 'hidden' && cs.display !== 'none'
+                        && parseFloat(cs.opacity) !== 0;
+                });
+                // Helper to set value via native setter so Vue updates.
+                function setVal(el, v) {
+                    const proto = window.HTMLInputElement.prototype;
+                    const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+                    setter.call(el, v);
+                    el.dispatchEvent(new Event('input',  { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new Event('blur',   { bubbles: true }));
+                }
+                // Strategy A: placeholder contains 'max' (case-insensitive),
+                // ignore the search bar ("What do you need today?").
+                let target = visible.find(el => {
+                    const ph = norm(el.placeholder || '');
+                    return ph.includes('max') && !ph.includes('today');
+                });
+                // Strategy B: a "$ Min" input exists; pick its right-neighbour.
+                if (!target) {
+                    const minInp = visible.find(el => norm(el.placeholder || '').includes('min'));
+                    if (minInp) {
+                        const minRect = minInp.getBoundingClientRect();
+                        target = visible.find(el => {
+                            if (el === minInp) return false;
+                            const r = el.getBoundingClientRect();
+                            // same row (overlap on Y), to the right of $ Min,
+                            // close in X.
+                            return Math.abs(r.top - minRect.top) < 20
+                                && r.left > minRect.left
+                                && r.left - (minRect.left + minRect.width) < 60;
+                        });
+                    }
+                }
+                // Strategy C: any sibling input under a PRICE-labelled section.
+                if (!target) {
+                    const priceHdrs = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6,div,span,p'))
+                        .filter(el => /price/i.test((el.innerText||el.textContent||'').trim()));
+                    for (const hdr of priceHdrs) {
+                        let scope = hdr.parentElement;
+                        for (let i = 0; i < 5 && scope; i++) {
+                            const ins = Array.from(scope.querySelectorAll('input'))
+                                .filter(el => visible.includes(el));
+                            if (ins.length >= 2) {
+                                // assume layout: [Min][Max] -> take second.
+                                target = ins[1]; break;
+                            }
+                            scope = scope.parentElement;
+                        }
+                        if (target) break;
+                    }
+                }
+                if (!target) {
+                    return { ok: false, reason: 'no $ Max input found',
+                             visibleCount: visible.length,
+                             placeholders: visible.map(el => el.placeholder).slice(0, 10) };
+                }
+                target.scrollIntoView({behavior: 'instant', block: 'center'});
+                target.focus();
+                setVal(target, '1');
+                return { ok: true, placeholder: target.placeholder || '',
+                         x: target.getBoundingClientRect().left,
+                         y: target.getBoundingClientRect().top };
+            }"""
+        )
+        logger.info(f"  $ Max filter result: {max_filter_applied}")
+        if not (max_filter_applied and max_filter_applied.get("ok")):
+            logger.warning(
+                "  $ Max filter input not found; will try to pick a cheap "
+                "product from the unfiltered list anyway.")
+        # Press Enter on the focused input (some Vue forms only apply the
+        # filter on Enter / blur). The setVal above already dispatches
+        # blur, but Enter is a safe extra nudge.
+        try:
+            page.keyboard.press("Enter")
+        except Exception:
+            pass
+        # Wait for the product list to refresh.
+        time.sleep(2.5)
+        try:
+            page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+        if debug_dir:
             try:
-                page.goto(catalog_url, wait_until="domcontentloaded", timeout=30000)
-                try:
-                    page.wait_for_load_state("networkidle", timeout=10000)
-                except Exception:
-                    pass
-                time.sleep(random.uniform(1.5, 2.5))
-                page.goto(seller_url, wait_until="domcontentloaded", timeout=45000)
-                try:
-                    page.wait_for_load_state("networkidle", timeout=10000)
-                except Exception:
-                    pass
-                time.sleep(random.uniform(1.5, 2.5))
-            except Exception as e:
-                logger.debug(f"  catalog-warm recovery failed: {e}")
-            if not _slider_or_login():
-                logger.success(
-                    f"  catalog-warm recovery succeeded. URL: {page.url}"
+                page.screenshot(
+                    path=os.path.join(debug_dir, "19c_after_max_filter.png"),
+                    full_page=False,
                 )
-                recovered = True
-            else:
-                if debug_dir:
-                    try:
-                        page.screenshot(
-                            path=os.path.join(debug_dir, "19d_after_catalog.png"),
-                            full_page=True,
-                        )
-                    except Exception:
-                        pass
+            except Exception:
+                pass
+
+        # Step 4-5: pick first product whose visible price is <= $0.50
+        # (else <= $1, which is anything in the filtered list).
+        logger.info("  scanning marketplace for cheap product (target <= $0.50, else <= $1)...")
+        picked = page.evaluate(
+            """() => {
+                // A 'product row' shows a price like "$X.YY" on the right.
+                // We scan all elements whose own text matches /^\\$[0-9.]+$/
+                // (price labels), walk up to a row-shaped ancestor, then
+                // capture both the row and its visible product name (the
+                // truncated label like "F..." or the full visible name).
+                const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+                const priceEls = Array.from(document.querySelectorAll('div, span, p, b, strong'))
+                    .filter(el => {
+                        const own = norm(Array.from(el.childNodes)
+                            .filter(n => n.nodeType === 3)
+                            .map(n => n.textContent).join(''));
+                        return /^\\$\\s*\\d+(\\.\\d+)?$/.test(own);
+                    });
+                const results = [];
+                for (const pe of priceEls) {
+                    try {
+                        const own = norm(Array.from(pe.childNodes)
+                            .filter(n => n.nodeType === 3)
+                            .map(n => n.textContent).join(''));
+                        const price = parseFloat(own.replace(/[^0-9.]/g, ''));
+                        if (!isFinite(price) || price <= 0) continue;
+                        // Walk up to a row container (similar logic to the
+                        // product-row finder).
+                        let row = null, cur = pe.parentElement;
+                        for (let i = 0; i < 8 && cur; i++) {
+                            const r = cur.getBoundingClientRect();
+                            if (r.width > 500 && r.height > 40 && r.height < 250) {
+                                row = cur; break;
+                            }
+                            cur = cur.parentElement;
+                        }
+                        if (!row) continue;
+                        const rr = row.getBoundingClientRect();
+                        // Skip rows that aren't currently in (or just below)
+                        // the viewport - "SOLD OUT" rows often have weird
+                        // layouts.
+                        if (rr.bottom < 0) continue;
+                        // Look for "SOLD OUT" badge inside the row.
+                        const rowText = norm(row.innerText || row.textContent || '');
+                        if (/sold out|out of stock/i.test(rowText)) continue;
+                        // Capture a likely product-name element: the
+                        // largest text node inside the row that isn't a
+                        // price, badge, or number-of-items ("x55").
+                        const labels = Array.from(row.querySelectorAll('div, span, p, h1, h2, h3, h4, h5, b, strong'))
+                            .map(el => norm(Array.from(el.childNodes)
+                                .filter(n => n.nodeType === 3)
+                                .map(n => n.textContent).join('')))
+                            .filter(t => t && t.length >= 3 && t.length <= 80
+                                       && !/^\\$\\s*\\d/.test(t)
+                                       && !/^x\\d+$/i.test(t)
+                                       && !/^high quality$|^verified$|^sold out$/i.test(t)
+                                       && !/^\\d+$/.test(t));
+                        // Heuristic: pick the LONGEST visible label - that's
+                        // usually the product name (e.g. "Microsoft Outlook
+                        // mails Selfreg Type-1") vs short badges.
+                        labels.sort((a, b) => b.length - a.length);
+                        const name = labels[0] || '';
+                        if (!name) continue;
+                        results.push({
+                            price, name,
+                            rowX: rr.left + rr.width / 2,
+                            rowY: rr.top + rr.height / 2,
+                        });
+                    } catch (e) {}
+                }
+                // Sort by ascending price, then prefer the first <= 0.50.
+                results.sort((a, b) => a.price - b.price);
+                return { count: results.length,
+                         items: results.slice(0, 10) };
+            }"""
+        )
+        logger.info(f"  marketplace scan: {picked}")
+        if not picked or not picked.get("items"):
+            logger.error(
+                "  marketplace fallback: could not find any product rows "
+                "with a visible price. Bailing out.")
+            if debug_dir:
+                try:
+                    page.screenshot(
+                        path=os.path.join(debug_dir, "19_no_products.png"),
+                        full_page=True,
+                    )
+                except Exception:
+                    pass
+            return False
+
+        items = picked["items"]
+        # Prefer <= $0.50, fall back to cheapest available.
+        cheap = [it for it in items if it["price"] <= 0.50]
+        chosen = cheap[0] if cheap else items[0]
+        logger.success(
+            f"  marketplace fallback chose: '{chosen['name']}' "
+            f"@ ${chosen['price']:.2f}"
+        )
+        # Scroll the chosen row into view so the existing find-row code
+        # can locate it.
+        try:
+            page.evaluate(
+                "([y]) => window.scrollTo({top: window.scrollY + y - window.innerHeight/2, behavior: 'instant'})",
+                [chosen["rowY"]],
+            )
+            time.sleep(0.6)
+        except Exception as e:
+            logger.debug(f"  scroll-to-cheap-row failed: {e}")
+        if debug_dir:
+            try:
+                page.screenshot(
+                    path=os.path.join(debug_dir, "19d_picked_cheap_row.png"),
+                    full_page=False,
+                )
+            except Exception:
+                pass
+        # OVERRIDE product_name so the existing find-row + cart-icon code
+        # finds THIS product instead of the original user-requested one.
+        product_name = chosen["name"]
+        recovered = True
 
         if not recovered:
             logger.error(
-                "All recovery strategies (go_back+logo, catalog-warm) "
-                "failed. The Quick verification slider / login wall is "
-                "still showing. The browser stays open so you can "
-                "complete it manually."
+                "Marketplace fallback failed. The browser stays open so "
+                "you can complete it manually."
             )
             return False
 
