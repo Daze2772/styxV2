@@ -2,6 +2,8 @@ patchright>=1.49.0
 opencv-python>=4.9.0
 numpy>=1.26.0
 loguru>=0.7.2
+web3>=7,<8
+python-dotenv>=1.0.0
 # Optional second-engine for the hardest Cloudflare cases.
 # Install separately:
 #   pip install "camoufox[geoip]"

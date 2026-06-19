@@ -13,6 +13,33 @@ Python automation using Playwright to register accounts on `https://styxmarket.s
 ## Implementation status (Feb 2026)
 
 ### Done
+- **Feb 2026 — Automated on-chain BNB BEP20 deposit (P0).** Per user request,
+  the script now auto-sends `0.001 BNB` from a configured BSC wallet to the
+  scraped Styx deposit address right after TOP UP BALANCE is submitted and
+  before `wait_for_deposit_confirmed()`. Implementation:
+    1. Added `web3>=7,<8` and `python-dotenv` to `requirements.txt`.
+    2. Wallet private key + RPC URL live in `/app/.env`
+       (`BSC_PRIVATE_KEY`, `BSC_RPC_URL`, `BSC_RPC_URL_FALLBACK`); loaded
+       at import time. `.env` is `.gitignore`d.
+    3. New helper `extract_deposit_address(page)` scrapes the EVM address
+       (strict `0x[a-fA-F0-9]{40}` regex) from copy-inputs / data-attrs /
+       body text on the post-submit top-up page.
+    4. New helper `send_bnb_deposit(to_address, amount_bnb=0.001,
+       max_retries=3)` builds/signs/sends a native BNB transfer
+       (`chainId=56`, `gas=21000`), waits for `eth.wait_for_transaction_receipt`,
+       retries up to 3 times on `TimeExhausted` / `Web3RPCError` /
+       `ValueError` / `OSError` / `RuntimeError` with 5s, 15s, 30s backoff.
+       On total failure raises `RuntimeError` (caller does `sys.exit(2)` per
+       user spec: HALT the entire run, do not skip to next account).
+    5. Wired between `do_topup()` and `wait_for_deposit_confirmed()` in
+       `process_registration()`. Persists pending account creds before
+       exiting on failure so creds are never lost.
+    6. New CLI flags `--no-web3-send` (default OFF; web3-send is ON by
+       default) and `--web3-amount` (default `0.001`).
+    7. Unit tests in `/app/tests/test_web3_send.py` (7/7 PASS): regex
+       validation, missing-key guard, invalid-address guard, and the
+       full 3-retry-then-raise flow with mocked RPC.
+
 - **Feb 2026 — Fixed mail/message icon being clicked instead of cart on
   seller page.** User reported: after deposit confirmed, the script visited
   the seller URL but clicked the "Write to seller" (envelope) icon instead

@@ -22,15 +22,27 @@ import random
 import string
 import csv
 import os
+import re
 import sys
 import math
 import tempfile
 import threading
 import time
+from decimal import Decimal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import cv2
 import numpy as np
 from loguru import logger
+
+# Load .env once at import time so that BSC_PRIVATE_KEY / BSC_RPC_URL are
+# available to send_bnb_deposit() without each caller having to remember.
+# python-dotenv is non-fatal on missing file (it just no-ops), which is what
+# we want when running without web3-send.
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass
 
 # patchright is a hardened-stealth fork of playwright. We REQUIRE it - falling
 # back to vanilla playwright silently makes the script useless against
@@ -1093,6 +1105,250 @@ def do_topup(page, amount, currency_label="BNB (BEP20)",
                         full_page=True)
     logger.success(f"Top-up submitted: {currency_label} amount={amount}")
     return True
+
+
+# ---------- web3 BNB deposit ---------------------------------------------------
+# A valid EVM address is "0x" + 40 hex chars. BSC native BNB has no prefix
+# (unlike TRX which uses "T...") so this regex is intentionally strict.
+_EVM_ADDR_RE = re.compile(r"0x[a-fA-F0-9]{40}")
+
+
+def extract_deposit_address(page, timeout_seconds=30, debug_dir=None):
+    """Scrape the on-page deposit address from Styx's post-submit top-up view.
+
+    After do_topup() submits "TOP UP BALANCE", Styx renders a panel with a QR
+    code, the deposit address (an EVM 0x... string for BNB/BEP20), and the
+    requested amount. We poll the DOM for that address until we find one or
+    the timeout expires.
+
+    Strategy (in priority order, all best-effort):
+      1. Look at inputs/textareas (Styx renders the address in a copy-input).
+      2. Look at any element whose data-* attrs contain the address.
+      3. Fall back to regex over the entire body innerText.
+
+    Returns the EVM checksum-normalised lower-case address as a string, or
+    None on timeout / error / wrong-coin (TRX prefix etc.).
+    """
+    logger.info("Extracting deposit address from top-up page...")
+    deadline = time.time() + max(5, int(timeout_seconds))
+    last_text_len = 0
+    while time.time() < deadline:
+        try:
+            data = page.evaluate(
+                """() => {
+                    const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+                    // (1) inputs/textareas
+                    const inputs = Array.from(document.querySelectorAll(
+                        'input, textarea'));
+                    const fromInputs = inputs
+                        .map(el => (el.value || el.getAttribute('value') || '').toString())
+                        .filter(v => /^0x[a-fA-F0-9]{40}$/.test(v.trim()));
+                    // (2) data-* attrs on any element
+                    const fromAttrs = [];
+                    Array.from(document.querySelectorAll('*')).slice(0, 5000).forEach(el => {
+                        try {
+                            for (const a of el.attributes) {
+                                if (a.name.startsWith('data-') && /^0x[a-fA-F0-9]{40}$/.test(a.value.trim())) {
+                                    fromAttrs.push(a.value.trim());
+                                }
+                            }
+                        } catch (e) {}
+                    });
+                    // (3) body text
+                    const bodyText = norm(document.body ? document.body.innerText : '');
+                    const matches = bodyText.match(/0x[a-fA-F0-9]{40}/g) || [];
+                    return {
+                        fromInputs: fromInputs,
+                        fromAttrs: fromAttrs,
+                        fromText: matches,
+                        textLen: bodyText.length,
+                    };
+                }"""
+            )
+        except Exception as e:
+            logger.debug(f"  address-probe failed: {e}")
+            time.sleep(1)
+            continue
+
+        # priority: inputs > data-attrs > body text
+        candidates = list(data.get("fromInputs") or [])
+        candidates += list(data.get("fromAttrs") or [])
+        candidates += list(data.get("fromText") or [])
+        # de-dupe preserving order, only valid 0x...40hex
+        seen = set()
+        clean = []
+        for c in candidates:
+            c = (c or "").strip()
+            if _EVM_ADDR_RE.fullmatch(c) and c.lower() not in seen:
+                seen.add(c.lower())
+                clean.append(c)
+        if clean:
+            addr = clean[0]
+            logger.success(f"Found deposit address: {addr}")
+            if debug_dir:
+                try:
+                    with open(os.path.join(debug_dir, "deposit_address.txt"),
+                              "w") as f:
+                        f.write(addr + "\n")
+                except Exception:
+                    pass
+            return addr
+
+        if data.get("textLen", 0) != last_text_len:
+            last_text_len = data.get("textLen", 0)
+            logger.debug(f"  no 0x address yet (textLen={last_text_len})")
+        time.sleep(1)
+
+    logger.error("Timed out extracting deposit address from top-up page.")
+    if debug_dir:
+        try:
+            page.screenshot(path=os.path.join(debug_dir,
+                            "15b_no_deposit_address.png"), full_page=True)
+        except Exception:
+            pass
+    return None
+
+
+def send_bnb_deposit(to_address, amount_bnb=0.001, max_retries=3,
+                     debug_dir=None):
+    """Send a native BNB transfer on BSC mainnet (chain id 56).
+
+    Reads BSC_PRIVATE_KEY / BSC_RPC_URL from environment (already loaded from
+    /app/.env at module import time). Retries up to `max_retries` times on
+    RPC/timeout/value errors with exponential backoff (5s, 15s, 30s, ...).
+
+    On total failure raises RuntimeError - caller MUST treat this as fatal
+    per user spec ("halt the entire run"). On success returns the tx hash
+    (0x-prefixed hex string).
+
+    NOTE: web3.py is only imported inside this function so that the rest of
+    the script (CAPTCHA solving, registration, ...) keeps running for users
+    who never enable the web3-send feature.
+    """
+    # ----- preflight env / lib checks ----------------------------------------
+    pk = os.environ.get("BSC_PRIVATE_KEY")
+    if not pk:
+        raise RuntimeError(
+            "BSC_PRIVATE_KEY is not set in /app/.env - cannot send BNB. "
+            "Either populate the env or pass --no-web3-send.")
+    rpc_url = os.environ.get("BSC_RPC_URL",
+                             "https://bsc-dataseed.bnbchain.org")
+    rpc_url_fb = os.environ.get("BSC_RPC_URL_FALLBACK",
+                                "https://bsc-dataseed.binance.org")
+    try:
+        from web3 import Web3
+        from web3.exceptions import TimeExhausted, Web3RPCError
+        from eth_account import Account
+    except ImportError as e:
+        raise RuntimeError(
+            f"web3.py is not installed ({e}). Run "
+            f"`pip install -r /app/requirements.txt`.") from e
+
+    if not _EVM_ADDR_RE.fullmatch((to_address or "").strip()):
+        raise RuntimeError(
+            f"Refusing to send to invalid EVM address: {to_address!r}")
+
+    # ----- build w3 (with fallback RPC) --------------------------------------
+    def _connect(url):
+        w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 20}))
+        if not w3.is_connected():
+            raise RuntimeError(f"RPC not reachable: {url}")
+        cid = int(w3.eth.chain_id)
+        if cid != 56:
+            raise RuntimeError(
+                f"Wrong chain id on {url}: got {cid}, expected 56 (BSC mainnet)")
+        return w3
+
+    try:
+        w3 = _connect(rpc_url)
+    except Exception as e:
+        logger.warning(f"Primary BSC RPC failed ({rpc_url}): {e}; "
+                       f"falling back to {rpc_url_fb}")
+        w3 = _connect(rpc_url_fb)
+
+    acct = Account.from_key(pk)
+    recipient = Web3.to_checksum_address(to_address)
+    value_wei = w3.to_wei(Decimal(str(amount_bnb)), "ether")
+
+    # Balance sanity check (only logged - actual send will fail anyway if low)
+    try:
+        bal_wei = w3.eth.get_balance(acct.address)
+        gas_price_est = w3.eth.gas_price
+        needed = value_wei + 21000 * gas_price_est
+        logger.info(
+            f"Sender {acct.address} balance={w3.from_wei(bal_wei, 'ether')} "
+            f"BNB, need ~{w3.from_wei(needed, 'ether')} BNB "
+            f"(value+gas), gasPrice={w3.from_wei(gas_price_est, 'gwei')} gwei")
+        if bal_wei < needed:
+            raise RuntimeError(
+                f"Insufficient BNB balance: have "
+                f"{w3.from_wei(bal_wei, 'ether')}, need ~"
+                f"{w3.from_wei(needed, 'ether')}. Top up the wallet at "
+                f"{acct.address} on BSC.")
+    except RuntimeError:
+        raise
+    except Exception as e:
+        logger.warning(f"Balance check failed ({e}); proceeding anyway.")
+
+    last_error = None
+    backoff = [5, 15, 30]
+    for attempt in range(1, max_retries + 1):
+        try:
+            nonce = w3.eth.get_transaction_count(acct.address,
+                                                 block_identifier="pending")
+            gas_price = w3.eth.gas_price
+            tx = {
+                "chainId": 56,
+                "from": acct.address,
+                "to": recipient,
+                "value": value_wei,
+                "nonce": nonce,
+                "gas": 21000,
+                "gasPrice": gas_price,
+            }
+            signed = w3.eth.account.sign_transaction(tx, private_key=acct.key)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            tx_hex = tx_hash.hex()
+            if not tx_hex.startswith("0x"):
+                tx_hex = "0x" + tx_hex
+            logger.success(
+                f"[attempt {attempt}/{max_retries}] BNB transfer broadcast: "
+                f"{tx_hex} - waiting for receipt...")
+            receipt = w3.eth.wait_for_transaction_receipt(
+                tx_hash, timeout=120, poll_latency=3)
+            if receipt.status != 1:
+                raise RuntimeError(
+                    f"Tx mined but reverted: status={receipt.status} "
+                    f"hash={tx_hex}")
+            logger.success(
+                f"BNB deposit confirmed on-chain: {tx_hex} "
+                f"(block {receipt.blockNumber}, gasUsed={receipt.gasUsed})")
+            if debug_dir:
+                try:
+                    with open(os.path.join(debug_dir, "tx_hash.txt"),
+                              "a") as f:
+                        f.write(
+                            f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t"
+                            f"{recipient}\t{amount_bnb}\t{tx_hex}\n")
+                except Exception:
+                    pass
+            return tx_hex
+        except (TimeExhausted, Web3RPCError, ValueError, OSError,
+                RuntimeError) as e:
+            last_error = e
+            logger.error(
+                f"[attempt {attempt}/{max_retries}] BNB send failed: "
+                f"{type(e).__name__}: {e}")
+            if attempt < max_retries:
+                wait = backoff[min(attempt - 1, len(backoff) - 1)]
+                logger.warning(f"  retrying in {wait}s...")
+                time.sleep(wait)
+                continue
+            break
+
+    raise RuntimeError(
+        f"BNB deposit failed after {max_retries} attempts. "
+        f"Last error: {last_error}")
 
 
 def wait_for_deposit_confirmed(page, timeout_seconds=900, poll_interval=3,
@@ -2266,7 +2522,8 @@ def process_registration(page, url, max_captcha_retries=3, debug_dir=None,
                          topup_amount=0, topup_currency="BNB (BEP20)",
                          keep_open=False, keep_session=False,
                          buy_seller_url=None, buy_product_name=None,
-                         deposit_timeout=900):
+                         deposit_timeout=900, web3_send=True,
+                         web3_amount_bnb=0.001):
     if not keep_session:
         _reset_site_session(page, url)
 
@@ -2600,6 +2857,51 @@ def process_registration(page, url, max_captcha_retries=3, debug_dir=None,
             # the deposit to be confirmed on-chain, then proceed to the
             # seller page and purchase.
             if topup_ok and buy_product_name and buy_seller_url:
+                # ----- Auto-send 0.001 BNB on BSC mainnet ---------------------
+                # Per user spec: extract the deposit address from the top-up
+                # page, send a native BNB transfer from the configured wallet,
+                # retry up to 3x, and HALT THE ENTIRE RUN on total failure
+                # (sys.exit(2)).
+                if web3_send:
+                    addr = extract_deposit_address(
+                        page, timeout_seconds=30, debug_dir=debug_dir)
+                    if not addr:
+                        logger.error(
+                            "Could not scrape the deposit address from the "
+                            "top-up page; cannot auto-send BNB. Halting run "
+                            "(per --no-web3-send safety policy).")
+                        sys.exit(2)
+                    try:
+                        tx_hash = send_bnb_deposit(
+                            to_address=addr,
+                            amount_bnb=web3_amount_bnb,
+                            max_retries=3,
+                            debug_dir=debug_dir,
+                        )
+                        logger.success(
+                            f"On-chain deposit sent for {username}: "
+                            f"{web3_amount_bnb} BNB -> {addr} (tx {tx_hash})")
+                    except RuntimeError as e:
+                        logger.error(
+                            f"BNB auto-send FAILED 3x for {username}: {e}")
+                        logger.error(
+                            "Halting the entire script per user policy. "
+                            "Fix the wallet/RPC, then re-run.")
+                        # Persist anything we have so the account is not lost.
+                        try:
+                            _persist_results([{
+                                "url": url, "username": username,
+                                "password": password, "secret": secret,
+                            }], "accounts.csv")
+                        except Exception:
+                            pass
+                        sys.exit(2)
+                else:
+                    logger.warning(
+                        "--no-web3-send is set; skipping on-chain BNB transfer. "
+                        "Send the funds manually if you want the deposit to "
+                        "confirm.")
+
                 try:
                     confirmed = wait_for_deposit_confirmed(
                         page,
@@ -2765,6 +3067,8 @@ def _run_with_patchright(args, urls, debug_dir, results, results_lock, profile_d
                         buy_seller_url=args.buy_seller_url if args.buy_after_topup else None,
                         buy_product_name=args.buy_product if args.buy_after_topup else None,
                         deposit_timeout=args.deposit_timeout,
+                        web3_send=not args.no_web3_send,
+                        web3_amount_bnb=args.web3_amount,
                     )
                     if result:
                         with results_lock:
@@ -2825,6 +3129,8 @@ def _run_with_camoufox(args, urls, debug_dir, results, results_lock, profile_dir
                         buy_seller_url=args.buy_seller_url if args.buy_after_topup else None,
                         buy_product_name=args.buy_product if args.buy_after_topup else None,
                         deposit_timeout=args.deposit_timeout,
+                        web3_send=not args.no_web3_send,
+                        web3_amount_bnb=args.web3_amount,
                     )
                     if result:
                         with results_lock:
@@ -2992,6 +3298,18 @@ def main():
                         help="Max seconds to wait for the deposit to be "
                              "confirmed on-chain before giving up on the "
                              "auto-buy step. Default: 900 (15 minutes).")
+    parser.add_argument("--no-web3-send", action="store_true",
+                        help="Disable the automated on-chain BNB transfer. "
+                             "When unset (default), after TOP UP BALANCE is "
+                             "submitted the script scrapes the deposit "
+                             "address from the page and sends "
+                             "--web3-amount BNB from the wallet whose "
+                             "BSC_PRIVATE_KEY lives in /app/.env. Retries up "
+                             "to 3x, then HALTS the whole run if all 3 fail.")
+    parser.add_argument("--web3-amount", type=float, default=0.001,
+                        help="BNB amount (native, not USD) to auto-send per "
+                             "deposit. Default: 0.001 (~$0.58). Ignored when "
+                             "--no-web3-send is set.")
     args = parser.parse_args()
 
     # Auto-detect real Chrome profile path if requested
