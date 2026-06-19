@@ -3018,7 +3018,7 @@ def main():
         with open(args.file) as f:
             urls.extend([ln.strip() for ln in f if ln.strip()])
     if not urls:
-        urls.append("https://styxmarket.si/accounts/register/?ref=7QXIWQR1")
+        urls.append("https://www.styxmarket.si/accounts/register/?ref=VM2FCOM6")
 
     debug_dir = None
     if args.debug:
