@@ -1230,7 +1230,136 @@ def wait_for_deposit_confirmed(page, timeout_seconds=900, poll_interval=5,
     return False
 
 
-def do_buy_product(page, seller_url, product_name, debug_dir=None):
+def _is_login_page(page):
+    """Return True if the current page looks like a login form.
+    We use multiple weak signals OR'd together so we catch all of:
+      - URL contains /login/, /signin/, /accounts/login
+      - There's a password input that's NOT inside a registration form
+      - The page title / body text says "Log in" / "Sign in" prominently
+    """
+    try:
+        sig = page.evaluate(
+            """() => {
+                const url = (location.pathname + location.search).toLowerCase();
+                const inLoginUrl = /\\/(login|sign[-_]?in|signin)(\\/|$|\\?)/.test(url);
+
+                // Password field with no register/sign-up fields next to it.
+                const pw = document.querySelector('input[type="password"]');
+                let hasPwOnly = false;
+                if (pw) {
+                    const form = pw.closest('form');
+                    if (form) {
+                        const inputs = form.querySelectorAll('input');
+                        // Registration forms typically have >=3 inputs (user
+                        // + pw + secret/confirm), login has 2.
+                        const text = (form.textContent || '').toLowerCase();
+                        const looksRegister = /register|sign[-_\\s]?up|create (an )?account/i.test(text);
+                        hasPwOnly = inputs.length <= 3 && !looksRegister;
+                    } else {
+                        hasPwOnly = true;
+                    }
+                }
+
+                const title = (document.title || '').toLowerCase();
+                const body = (document.body ? document.body.innerText : '').slice(0, 600).toLowerCase();
+                const loginText = /\\blog[\\s-]?in\\b|\\bsign[\\s-]?in\\b/.test(title)
+                    || /forgot (your )?password|remember me|log in to your account|sign in to your account/.test(body);
+
+                return { inLoginUrl, hasPwOnly, loginText,
+                         url: location.pathname + location.search };
+            }"""
+        )
+    except Exception as e:
+        logger.debug(f"  _is_login_page probe failed: {e}")
+        return False
+    # At least two signals to be confident.
+    score = int(bool(sig.get("inLoginUrl"))) + int(bool(sig.get("hasPwOnly"))) \
+            + int(bool(sig.get("loginText")))
+    if score >= 2:
+        logger.warning(f"  Page looks like a login form: {sig}")
+        return True
+    return False
+
+
+def do_login(page, base_url, username, password, debug_dir=None):
+    """Log in to Styx using known username/password. Used as recovery when
+    a navigation lands us on the login page (e.g. session expired during
+    the long blockchain confirmation wait).
+    """
+    login_url = base_url.rstrip("/") + "/accounts/login/"
+    logger.info(f"Attempting re-login at: {login_url}  (user={username})")
+    try:
+        page.goto(login_url, wait_until="domcontentloaded", timeout=45000)
+    except Exception as e:
+        logger.error(f"  failed to open login page: {e}")
+        return False
+    time.sleep(random.uniform(1.0, 1.8))
+    if debug_dir:
+        page.screenshot(path=os.path.join(debug_dir, "30_login_form.png"),
+                        full_page=True)
+
+    ok_u = smart_fill(page,
+        ["input[name='username']",
+         "input[name='login']",
+         "input[name='email']",
+         "input[type='text']",
+         "input.input__input"],
+        username, label="login_username")
+    ok_p = smart_fill(page,
+        ["input[name='password']",
+         "input[type='password']",
+         "input.input__input[type='password']"],
+        password, label="login_password")
+    if not (ok_u and ok_p):
+        logger.error(f"  could not fill login form (user={ok_u}, pw={ok_p})")
+        return False
+
+    # Submit. Try several strategies; first that succeeds wins.
+    submitted = False
+    submit_strategies = [
+        lambda: page.get_by_role("button", name="Log in", exact=False).first.click(timeout=4000),
+        lambda: page.get_by_role("button", name="Sign in", exact=False).first.click(timeout=4000),
+        lambda: page.locator("button[type='submit']:visible").first.click(timeout=4000),
+        lambda: page.locator("button:has-text('Log in'):visible").first.click(timeout=4000),
+        lambda: page.locator("button:has-text('Sign in'):visible").first.click(timeout=4000),
+        lambda: page.keyboard.press("Enter"),
+    ]
+    for i, s in enumerate(submit_strategies, 1):
+        try:
+            s()
+            submitted = True
+            logger.info(f"  -> submitted login form (strategy {i})")
+            break
+        except Exception as e:
+            logger.debug(f"  login submit strategy {i} failed: {e}")
+    if not submitted:
+        logger.error("  could not submit login form.")
+        return False
+
+    # Wait for navigation away from /login/.
+    try:
+        page.wait_for_function(
+            """() => !/\\/(login|sign[-_]?in|signin)(\\/|$|\\?)/.test(
+                location.pathname + location.search)""",
+            timeout=15000,
+        )
+    except Exception as e:
+        logger.debug(f"  post-login navigation wait timed out: {e}")
+    time.sleep(random.uniform(1.0, 1.6))
+    if debug_dir:
+        page.screenshot(path=os.path.join(debug_dir, "31_after_login.png"),
+                        full_page=True)
+
+    # Final verification: are we still on a login page?
+    if _is_login_page(page):
+        logger.error(f"  Re-login failed (still on login page). URL: {page.url}")
+        return False
+    logger.success(f"  Re-login succeeded. URL: {page.url}")
+    return True
+
+
+def do_buy_product(page, seller_url, product_name, debug_dir=None,
+                   login_username=None, login_password=None):
     """Navigate to a seller's profile page, find a product by name, add it to
     the cart via the row's small shopping-cart icon, then open the header
     cart, click Buy, and confirm Yes.
@@ -1241,6 +1370,10 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None):
             "https://styxmarket.si/accounts/profile/SCENARIO/?vue=true&user_id=28868"
         product_name: visible product label, e.g. "Firstmail.ltd E-Mail Accounts".
         debug_dir: optional dir for screenshots.
+        login_username, login_password: optional credentials used to auto-
+            re-login if the seller URL redirects to the login page (which
+            happens when Styx invalidates the session during the long
+            blockchain-confirmation wait).
 
     Returns True on success.
     """
@@ -1255,6 +1388,51 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None):
     except Exception:
         pass
     time.sleep(random.uniform(1.5, 2.5))
+
+    # ----- Session-expired recovery ------------------------------------------
+    # If the seller URL redirected us to the login page, our session must
+    # have been invalidated during the long wait_for_deposit_confirmed poll
+    # (Styx kills sessions during long-idle periods, AND sometimes after
+    # the first successful deposit on a brand-new account as an anti-abuse
+    # measure). We have the credentials we just registered with - log back
+    # in and retry the seller navigation.
+    if _is_login_page(page):
+        logger.warning(
+            "Seller page redirected to login (session likely expired during "
+            "deposit wait). Attempting auto re-login."
+        )
+        if debug_dir:
+            page.screenshot(path=os.path.join(debug_dir, "20a_login_redirect.png"),
+                            full_page=True)
+        if not (login_username and login_password):
+            logger.error(
+                "  No credentials available for re-login (login_username / "
+                "login_password not passed). Cannot recover. The browser "
+                "stays open so you can complete it manually."
+            )
+            return False
+        from urllib.parse import urlparse
+        u = urlparse(seller_url)
+        base = f"{u.scheme}://{u.netloc}"
+        if not do_login(page, base, login_username, login_password,
+                        debug_dir=debug_dir):
+            logger.error("  Auto re-login failed.")
+            return False
+        # Re-navigate to seller page now that we're logged in.
+        logger.info(f"  Re-navigating to seller page: {seller_url}")
+        try:
+            page.goto(seller_url, wait_until="domcontentloaded", timeout=45000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
+            time.sleep(random.uniform(1.5, 2.5))
+        except Exception as e:
+            logger.error(f"  re-navigation to seller page failed: {e}")
+            return False
+        if _is_login_page(page):
+            logger.error("  Still on login page after re-login attempt. Aborting.")
+            return False
 
     if debug_dir:
         page.screenshot(path=os.path.join(debug_dir, "20_seller_page.png"),
@@ -2287,7 +2465,9 @@ def process_registration(page, url, max_captcha_retries=3, debug_dir=None,
                         do_buy_product(page,
                                        seller_url=buy_seller_url,
                                        product_name=buy_product_name,
-                                       debug_dir=debug_dir)
+                                       debug_dir=debug_dir,
+                                       login_username=username,
+                                       login_password=password)
                     except Exception as e:
                         logger.error(f"Buy-flow crashed: {e}")
                 else:
