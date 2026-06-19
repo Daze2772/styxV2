@@ -1389,50 +1389,112 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None,
         pass
     time.sleep(random.uniform(1.5, 2.5))
 
-    # ----- Session-expired recovery ------------------------------------------
-    # If the seller URL redirected us to the login page, our session must
-    # have been invalidated during the long wait_for_deposit_confirmed poll
-    # (Styx kills sessions during long-idle periods, AND sometimes after
-    # the first successful deposit on a brand-new account as an anti-abuse
-    # measure). We have the credentials we just registered with - log back
-    # in and retry the seller navigation.
+    # ----- Session-expired / first-hit-redirect recovery ---------------------
+    # User-confirmed pattern: when this navigation lands on the login page,
+    # clicking BACK in the browser shows the previous page still fully
+    # authenticated, and re-navigating to the seller URL from there works.
+    # This means the session is NOT actually expired - Styx's Vue SPA at
+    # `?vue=true&user_id=...` has a first-hit auth-hydration race where the
+    # SPA's bootstrap API call fires before the session state is available,
+    # so the Vue app redirects to /login/. A back-then-forward (or just a
+    # second goto after a small delay) avoids this because the SPA is now
+    # hydrated.
+    #
+    # Recovery ladder:
+    #   1. page.go_back() to the previous (authenticated) page, then re-goto
+    #      the seller URL. Up to 2 retries.
+    #   2. If retries didn't help, visit the homepage to "warm" the session,
+    #      then goto the seller URL.
+    #   3. If we're STILL on a login page, the session really is dead -
+    #      auto re-login using the credentials we registered with.
     if _is_login_page(page):
         logger.warning(
-            "Seller page redirected to login (session likely expired during "
-            "deposit wait). Attempting auto re-login."
+            "Seller page landed on a login form. Trying go-back + retry "
+            "first (the user's session is usually still alive; Styx's Vue "
+            "SPA has a first-hit auth-hydration race)."
         )
         if debug_dir:
             page.screenshot(path=os.path.join(debug_dir, "20a_login_redirect.png"),
                             full_page=True)
-        if not (login_username and login_password):
-            logger.error(
-                "  No credentials available for re-login (login_username / "
-                "login_password not passed). Cannot recover. The browser "
-                "stays open so you can complete it manually."
-            )
-            return False
-        from urllib.parse import urlparse
-        u = urlparse(seller_url)
-        base = f"{u.scheme}://{u.netloc}"
-        if not do_login(page, base, login_username, login_password,
-                        debug_dir=debug_dir):
-            logger.error("  Auto re-login failed.")
-            return False
-        # Re-navigate to seller page now that we're logged in.
-        logger.info(f"  Re-navigating to seller page: {seller_url}")
-        try:
-            page.goto(seller_url, wait_until="domcontentloaded", timeout=45000)
+
+        # Strategy 1: go_back then re-goto, up to 2 times.
+        recovered = False
+        for retry in range(2):
+            logger.info(f"  recovery attempt {retry + 1}/2: page.go_back() then re-goto.")
             try:
-                page.wait_for_load_state("networkidle", timeout=10000)
-            except Exception:
-                pass
-            time.sleep(random.uniform(1.5, 2.5))
-        except Exception as e:
-            logger.error(f"  re-navigation to seller page failed: {e}")
-            return False
-        if _is_login_page(page):
-            logger.error("  Still on login page after re-login attempt. Aborting.")
-            return False
+                page.go_back(wait_until="domcontentloaded", timeout=15000)
+                time.sleep(random.uniform(1.5, 2.5))
+            except Exception as e:
+                logger.debug(f"  go_back failed: {e}")
+            try:
+                page.goto(seller_url, wait_until="domcontentloaded", timeout=45000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
+                time.sleep(random.uniform(1.5, 2.5))
+            except Exception as e:
+                logger.debug(f"  re-goto seller_url failed: {e}")
+                continue
+            if not _is_login_page(page):
+                logger.success(f"  Recovery attempt {retry + 1} succeeded "
+                               f"(go-back + retry). URL: {page.url}")
+                recovered = True
+                break
+
+        # Strategy 2: warm the session via the homepage, then re-goto.
+        if not recovered:
+            from urllib.parse import urlparse
+            u = urlparse(seller_url)
+            base = f"{u.scheme}://{u.netloc}"
+            logger.info(f"  recovery attempt 3: warm via homepage {base}/ then re-goto.")
+            try:
+                page.goto(base + "/", wait_until="domcontentloaded", timeout=30000)
+                time.sleep(random.uniform(1.5, 2.5))
+                page.goto(seller_url, wait_until="domcontentloaded", timeout=45000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
+                time.sleep(random.uniform(1.5, 2.5))
+            except Exception as e:
+                logger.debug(f"  homepage-warm recovery failed: {e}")
+            if not _is_login_page(page):
+                logger.success(f"  Recovery via homepage-warm succeeded. URL: {page.url}")
+                recovered = True
+
+        # Strategy 3 (last resort): the session really is dead -> auto re-login.
+        if not recovered:
+            logger.warning("  Back-retry and homepage-warm both failed. "
+                           "Falling back to auto re-login.")
+            if not (login_username and login_password):
+                logger.error(
+                    "  No credentials available for re-login (login_username / "
+                    "login_password not passed). Cannot recover. The browser "
+                    "stays open so you can complete it manually."
+                )
+                return False
+            from urllib.parse import urlparse
+            u = urlparse(seller_url)
+            base = f"{u.scheme}://{u.netloc}"
+            if not do_login(page, base, login_username, login_password,
+                            debug_dir=debug_dir):
+                logger.error("  Auto re-login failed.")
+                return False
+            logger.info(f"  Re-navigating to seller page: {seller_url}")
+            try:
+                page.goto(seller_url, wait_until="domcontentloaded", timeout=45000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
+                time.sleep(random.uniform(1.5, 2.5))
+            except Exception as e:
+                logger.error(f"  re-navigation to seller page failed: {e}")
+                return False
+            if _is_login_page(page):
+                logger.error("  Still on login page after re-login attempt. Aborting.")
+                return False
 
     if debug_dir:
         page.screenshot(path=os.path.join(debug_dir, "20_seller_page.png"),
