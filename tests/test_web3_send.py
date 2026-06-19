@@ -69,9 +69,11 @@ class TestSendBnbDeposit(unittest.TestCase):
         self.assertIn("BSC_PRIVATE_KEY", str(ctx.exception))
 
     def test_retries_three_times_then_raises(self):
-        # Ensure key is set so we get past the env preflight
-        os.environ["BSC_PRIVATE_KEY"] = (
-            "0x73ebcad273135f7f256d33022a2eab14d2c07ef170db65277bdda68fe42fc8b8")
+        # Ensure key is set so we get past the env preflight. We generate
+        # a fresh random throwaway 32-byte key per test run so no real
+        # private key is ever hardcoded in source / git history.
+        import secrets
+        os.environ["BSC_PRIVATE_KEY"] = "0x" + secrets.token_hex(32)
 
         # Build a fake w3 object whose send_raw_transaction always blows up.
         fake_w3 = mock.MagicMock()
