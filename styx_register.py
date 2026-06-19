@@ -1230,6 +1230,71 @@ def wait_for_deposit_confirmed(page, timeout_seconds=900, poll_interval=5,
     return False
 
 
+def do_quick_verification(page, timeout_ms=4000, wait_after=7.0, debug_dir=None,
+                          screenshot_prefix=None):
+    """Detect & dismiss Styx's 'Quick verification' challenge (the credit-card
+    slider + Continue button) if it's currently shown.
+
+    Styx fires this challenge in two situations:
+      1. First visit to the site (handled inline in process_registration).
+      2. Subsequent navigations to a page after a long idle period (e.g.
+         after we've been polling /wallet/deposit/... for several minutes
+         waiting for blockchain confirmation). The user hit this when
+         landing on the seller URL: the page shows "Quick verification /
+         Please complete a short check to continue to the site / Continue".
+         Previously we mis-classified this as a login page.
+
+    Returns True if the challenge was dismissed (or wasn't present);
+    False only if it WAS present but we failed to click Continue.
+    """
+    try:
+        # Multi-signal: the title says "Quick verification" / "Please
+        # complete a short check" AND there's a Continue button.
+        sig = page.evaluate(
+            """() => {
+                const text = (document.body ? document.body.innerText : '').toLowerCase();
+                const hasTitle = /quick verification|short check to continue|please complete a short check/i.test(text);
+                const hasContinueText = /your connection will be encrypted/i.test(text);
+                return { hasTitle, hasContinueText, len: text.length };
+            }"""
+        )
+    except Exception:
+        sig = None
+
+    looks_like_quickverify = bool(sig) and (sig.get("hasTitle") or sig.get("hasContinueText"))
+    if not looks_like_quickverify:
+        return True  # nothing to dismiss
+
+    logger.info(f"Quick verification challenge detected: {sig}")
+    if debug_dir and screenshot_prefix:
+        try:
+            page.screenshot(path=os.path.join(debug_dir, f"{screenshot_prefix}_quickverify.png"),
+                            full_page=True)
+        except Exception:
+            pass
+    try:
+        cont = page.locator(
+            "button:has-text('Continue'), .continue-btn, #continue"
+        ).first
+        if cont.is_visible(timeout=timeout_ms):
+            # Small human-like delay before clicking.
+            time.sleep(random.uniform(1.0, 2.0))
+            cont.click()
+            logger.info("Clicked Quick verification 'Continue'.")
+            # The loading-bar animation is ~5-7s, then the page navigates.
+            time.sleep(wait_after)
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            return True
+        logger.warning("Quick verification shown but Continue button not visible.")
+        return False
+    except Exception as e:
+        logger.warning(f"Failed to click Quick verification Continue: {e}")
+        return False
+
+
 def _is_login_page(page):
     """Return True if the current page looks like a login form.
     We use multiple weak signals OR'd together so we catch all of:
@@ -1389,6 +1454,14 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None,
         pass
     time.sleep(random.uniform(1.5, 2.5))
 
+    # Styx re-runs its "Quick verification" challenge (credit-card slider +
+    # Continue button) on this navigation because the previous page was
+    # idling for several minutes during the blockchain-confirmation wait.
+    # We need to dismiss it BEFORE anything else - otherwise the product
+    # lookup runs against the verification page DOM and fails with
+    # samples like ['Quick verification', 'Please complete a short check'].
+    do_quick_verification(page, debug_dir=debug_dir, screenshot_prefix="19")
+
     # ----- Session-expired / first-hit-redirect recovery ---------------------
     # User-confirmed pattern: when this navigation lands on the login page,
     # clicking BACK in the browser shows the previous page still fully
@@ -1433,6 +1506,9 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None,
                 except Exception:
                     pass
                 time.sleep(random.uniform(1.5, 2.5))
+                # Re-arming nav may trigger Quick verification again.
+                do_quick_verification(page, debug_dir=debug_dir,
+                                      screenshot_prefix=f"19r{retry+1}")
             except Exception as e:
                 logger.debug(f"  re-goto seller_url failed: {e}")
                 continue
@@ -1451,12 +1527,16 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None,
             try:
                 page.goto(base + "/", wait_until="domcontentloaded", timeout=30000)
                 time.sleep(random.uniform(1.5, 2.5))
+                do_quick_verification(page, debug_dir=debug_dir,
+                                      screenshot_prefix="19warm")
                 page.goto(seller_url, wait_until="domcontentloaded", timeout=45000)
                 try:
                     page.wait_for_load_state("networkidle", timeout=10000)
                 except Exception:
                     pass
                 time.sleep(random.uniform(1.5, 2.5))
+                do_quick_verification(page, debug_dir=debug_dir,
+                                      screenshot_prefix="19warm2")
             except Exception as e:
                 logger.debug(f"  homepage-warm recovery failed: {e}")
             if not _is_login_page(page):
