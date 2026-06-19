@@ -1437,10 +1437,12 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None,
             "https://styxmarket.si/accounts/profile/SCENARIO/?vue=true&user_id=28868"
         product_name: visible product label, e.g. "Firstmail.ltd E-Mail Accounts".
         debug_dir: optional dir for screenshots.
-        login_username, login_password: optional credentials used to auto-
-            re-login if the seller URL redirects to the login page (which
-            happens when Styx invalidates the session during the long
-            blockchain-confirmation wait).
+        login_username, login_password: kept for backward-compatibility with
+            the caller; no longer used (the previous "auto re-login as first
+            recovery strategy" was removed per user request — clicking the
+            Quick Verification 'Continue' button is what kills the session, so
+            we now recover by avoiding it entirely: go_back first, catalog-
+            warm second).
 
     Returns True on success.
     """
@@ -1456,126 +1458,128 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None,
         pass
     time.sleep(random.uniform(1.5, 2.5))
 
+    # ----- Quick Verification slider recovery --------------------------------
     # Styx re-runs its "Quick verification" challenge (credit-card slider +
     # Continue button) on this navigation because the previous page was
     # idling for several minutes during the blockchain-confirmation wait.
-    # We need to dismiss it BEFORE anything else - otherwise the product
-    # lookup runs against the verification page DOM and fails with
-    # samples like ['Quick verification', 'Please complete a short check'].
-    do_quick_verification(page, debug_dir=debug_dir, screenshot_prefix="19")
-
-    # ----- Post-Quick-Verification login redirect -----------------------------
-    # User-observed sequence (verified in the field):
-    #   1. goto(seller_url) -> Styx shows "Quick verification" challenge.
-    #   2. do_quick_verification clicks Continue.
-    #   3. The post-challenge navigation lands on /accounts/login/ (Styx
-    #      genuinely invalidates the session as part of the long deposit-
-    #      wait + verification flow).
     #
-    # Recovery ladder is therefore reordered: when we have credentials,
-    # do_login is by far the most reliable path. go_back / homepage-warm
-    # only help for the rare SPA hydration race, so they're fallbacks.
-    if _is_login_page(page):
+    # IMPORTANT (field-verified): clicking the slider's "Continue" button
+    # invalidates the session and redirects us to /accounts/login/ - a full
+    # session reset. So we DEFINITELY DO NOT click Continue here. Instead we
+    # nudge the browser into a different navigation state and re-try the
+    # seller URL, hoping Styx no longer issues the challenge.
+    #
+    # Recovery ladder (no re-login, no Continue click - per user spec):
+    #   1. page.go_back() then re-goto seller_url.
+    #   2. goto the public catalog page, then re-goto seller_url.
+    # If both fail we bail out and leave the browser open for manual handling.
+    def _slider_or_login():
+        """Return True if the current page is the QV slider OR a login wall."""
+        try:
+            sig = page.evaluate(
+                """() => {
+                    const text = (document.body ? document.body.innerText : '').toLowerCase();
+                    const hasTitle = /quick verification|short check to continue|please complete a short check/i.test(text);
+                    const hasContinueText = /your connection will be encrypted/i.test(text);
+                    return hasTitle || hasContinueText;
+                }"""
+            )
+        except Exception:
+            sig = False
+        if sig:
+            return True
+        return _is_login_page(page)
+
+    if _slider_or_login():
         logger.warning(
-            "Seller page navigation landed on a login form (likely after "
-            "Quick Verification cleared the session). Attempting recovery."
+            "Quick verification slider (or login wall) detected on seller "
+            "page. Avoiding the 'Continue' click (which kills the session) "
+            "and attempting alternative recovery."
         )
         if debug_dir:
-            page.screenshot(path=os.path.join(debug_dir, "20a_login_redirect.png"),
-                            full_page=True)
-
-        recovered = False
-        from urllib.parse import urlparse
-        u = urlparse(seller_url)
-        base = f"{u.scheme}://{u.netloc}"
-
-        # Strategy 1: do_login with the credentials we registered with.
-        # Most reliable when the session is actually dead.
-        if login_username and login_password:
-            logger.info("  recovery: attempting auto re-login.")
-            if do_login(page, base, login_username, login_password,
-                        debug_dir=debug_dir):
-                logger.info(f"  re-navigating to seller page: {seller_url}")
-                try:
-                    page.goto(seller_url, wait_until="domcontentloaded", timeout=45000)
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=10000)
-                    except Exception:
-                        pass
-                    time.sleep(random.uniform(1.5, 2.5))
-                    # The post-login goto may trigger Quick Verification AGAIN.
-                    do_quick_verification(page, debug_dir=debug_dir,
-                                          screenshot_prefix="19li")
-                except Exception as e:
-                    logger.debug(f"  post-login goto failed: {e}")
-                if not _is_login_page(page):
-                    logger.success(f"  Auto re-login recovery succeeded. URL: {page.url}")
-                    recovered = True
-                else:
-                    logger.warning("  Post-login re-navigation landed on login again. "
-                                   "Falling through to other strategies.")
-            else:
-                logger.warning("  Auto re-login attempt failed; trying other strategies.")
-        else:
-            logger.warning("  No credentials available for re-login; "
-                           "falling back to navigation tricks.")
-
-        # Strategy 2: go_back then re-goto, up to 2 times. Useful for the
-        # SPA hydration race (the original symptom).
-        if not recovered:
-            for retry in range(2):
-                logger.info(f"  recovery: go_back+re-goto attempt {retry + 1}/2.")
-                try:
-                    page.go_back(wait_until="domcontentloaded", timeout=15000)
-                    time.sleep(random.uniform(1.5, 2.5))
-                except Exception as e:
-                    logger.debug(f"  go_back failed: {e}")
-                try:
-                    page.goto(seller_url, wait_until="domcontentloaded", timeout=45000)
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=10000)
-                    except Exception:
-                        pass
-                    time.sleep(random.uniform(1.5, 2.5))
-                    do_quick_verification(page, debug_dir=debug_dir,
-                                          screenshot_prefix=f"19r{retry+1}")
-                except Exception as e:
-                    logger.debug(f"  re-goto seller_url failed: {e}")
-                    continue
-                if not _is_login_page(page):
-                    logger.success(
-                        f"  go_back+retry attempt {retry + 1} succeeded. URL: {page.url}"
-                    )
-                    recovered = True
-                    break
-
-        # Strategy 3: warm the session via the homepage, then re-goto.
-        if not recovered:
-            logger.info(f"  recovery: warm via homepage {base}/ then re-goto.")
             try:
-                page.goto(base + "/", wait_until="domcontentloaded", timeout=30000)
+                page.screenshot(
+                    path=os.path.join(debug_dir, "19_slider_detected.png"),
+                    full_page=True,
+                )
+            except Exception:
+                pass
+
+        catalog_url = "https://www.styxmarket.si/shop/catalog/?vue=true"
+        recovered = False
+
+        # Strategy 1: go_back, then re-goto seller_url.
+        logger.info("  recovery 1: page.go_back() -> re-goto seller_url.")
+        try:
+            page.go_back(wait_until="domcontentloaded", timeout=15000)
+            time.sleep(random.uniform(1.5, 2.5))
+        except Exception as e:
+            logger.debug(f"  go_back failed: {e}")
+        try:
+            page.goto(seller_url, wait_until="domcontentloaded", timeout=45000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
+            time.sleep(random.uniform(1.5, 2.5))
+        except Exception as e:
+            logger.debug(f"  re-goto seller_url after go_back failed: {e}")
+        if not _slider_or_login():
+            logger.success(f"  go_back recovery succeeded. URL: {page.url}")
+            recovered = True
+        else:
+            logger.warning(
+                "  go_back recovery did not clear the slider/login wall."
+            )
+            if debug_dir:
+                try:
+                    page.screenshot(
+                        path=os.path.join(debug_dir, "19a_after_goback.png"),
+                        full_page=True,
+                    )
+                except Exception:
+                    pass
+
+        # Strategy 2: warm via the public catalog page, then re-goto seller_url.
+        if not recovered:
+            logger.info(
+                f"  recovery 2: goto catalog {catalog_url} -> re-goto seller_url."
+            )
+            try:
+                page.goto(catalog_url, wait_until="domcontentloaded", timeout=30000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
                 time.sleep(random.uniform(1.5, 2.5))
-                do_quick_verification(page, debug_dir=debug_dir,
-                                      screenshot_prefix="19warm")
                 page.goto(seller_url, wait_until="domcontentloaded", timeout=45000)
                 try:
                     page.wait_for_load_state("networkidle", timeout=10000)
                 except Exception:
                     pass
                 time.sleep(random.uniform(1.5, 2.5))
-                do_quick_verification(page, debug_dir=debug_dir,
-                                      screenshot_prefix="19warm2")
             except Exception as e:
-                logger.debug(f"  homepage-warm recovery failed: {e}")
-            if not _is_login_page(page):
-                logger.success(f"  homepage-warm recovery succeeded. URL: {page.url}")
+                logger.debug(f"  catalog-warm recovery failed: {e}")
+            if not _slider_or_login():
+                logger.success(
+                    f"  catalog-warm recovery succeeded. URL: {page.url}"
+                )
                 recovered = True
+            else:
+                if debug_dir:
+                    try:
+                        page.screenshot(
+                            path=os.path.join(debug_dir, "19b_after_catalog.png"),
+                            full_page=True,
+                        )
+                    except Exception:
+                        pass
 
         if not recovered:
             logger.error(
-                "All recovery strategies failed. Cannot proceed past the "
-                "login wall. The browser stays open so you can complete it "
-                "manually."
+                "All recovery strategies (go_back, catalog-warm) failed. The "
+                "Quick verification slider / login wall is still showing. "
+                "The browser stays open so you can complete it manually."
             )
             return False
 
