@@ -1047,6 +1047,49 @@ def do_topup(page, amount, currency_label="BNB (BEP20)",
          lambda: page.locator("button:has-text('Top up')").last.click(timeout=5000, force=True)),
     ]
 
+    # ---- Diagnostic: enumerate every visible button-like element so the
+    # debug log tells us exactly what's on the page if all strategies fail.
+    try:
+        candidates_dump = page.evaluate(
+            """() => {
+                const out = [];
+                const els = document.querySelectorAll(
+                    'button, [role="button"], input[type="submit"], a.button, a[class*="button" i], a.btn, a[class*="btn" i]');
+                for (const el of els) {
+                    try {
+                        const r = el.getBoundingClientRect();
+                        const cs = getComputedStyle(el);
+                        if (r.width < 4 || r.height < 4) continue;
+                        if (cs.visibility === 'hidden' || cs.display === 'none'
+                            || parseFloat(cs.opacity) === 0) continue;
+                        if (r.top < -10 || r.left < -10
+                            || r.top > window.innerHeight + 100) continue;
+                        const txt = (el.innerText || el.textContent || '').trim().slice(0, 80);
+                        out.push({
+                            tag: el.tagName.toLowerCase(),
+                            type: el.getAttribute('type') || '',
+                            cls: (el.className && el.className.toString
+                                  ? el.className.toString() : '').slice(0, 80),
+                            txt: txt,
+                            disabled: el.disabled === true
+                                     || el.getAttribute('aria-disabled') === 'true',
+                            x: Math.round(r.left + r.width / 2),
+                            y: Math.round(r.top + r.height / 2),
+                        });
+                    } catch (e) {}
+                }
+                return out.slice(0, 40);
+            }"""
+        )
+        if candidates_dump:
+            logger.info("  visible clickable candidates on top-up page:")
+            for c in candidates_dump:
+                logger.info(
+                    f"    <{c['tag']} type={c['type']!r} disabled={c['disabled']} "
+                    f"@({c['x']},{c['y']}) cls={c['cls']!r} txt={c['txt']!r}")
+    except Exception as e:
+        logger.debug(f"  diagnostic enumeration failed: {e}")
+
     btn_clicked = False
     for i, (name, strat) in enumerate(btn_strategies, 1):
         try:
@@ -1081,6 +1124,138 @@ def do_topup(page, amount, currency_label="BNB (BEP20)",
                 btn_clicked = True
                 break
             logger.debug(f"  topup-button strategy {i} ({name}) failed: {err_msg[:200]}")
+
+    # ---- Strategy 8: trusted mouse-click on the best heuristic candidate.
+    # Finds the visible+enabled button-like element whose text best matches
+    # /top.?up|deposit|submit|pay/i, scores by position (bottom-of-form is
+    # better), and clicks via page.mouse.click (real CDP event).
+    if not btn_clicked:
+        logger.info("  strategy 8: heuristic mouse-click on best topup-button candidate.")
+        try:
+            best = page.evaluate(
+                """() => {
+                    const rx = /(top.?up|deposit|pay|submit|continue|confirm)/i;
+                    const allow = ['button', 'a', 'input', 'div', 'span'];
+                    const out = [];
+                    const els = document.querySelectorAll('*');
+                    for (const el of els) {
+                        try {
+                            const tag = el.tagName ? el.tagName.toLowerCase() : '';
+                            if (!allow.includes(tag)) continue;
+                            const r = el.getBoundingClientRect();
+                            if (r.width < 30 || r.height < 18) continue;
+                            const cs = getComputedStyle(el);
+                            if (cs.visibility === 'hidden' || cs.display === 'none'
+                                || parseFloat(cs.opacity) === 0) continue;
+                            if (el.disabled === true
+                                || el.getAttribute('aria-disabled') === 'true') continue;
+                            const txt = (el.innerText || el.textContent || '').trim();
+                            if (!txt || txt.length > 60) continue;
+                            if (!rx.test(txt)) continue;
+                            // skip the refund-modal hidden submit etc.
+                            const cls = (el.className && el.className.toString
+                                          ? el.className.toString() : '').toLowerCase();
+                            if (/refund|modal/.test(cls)) continue;
+                            let score = 0;
+                            if (/top.?up.?balance/i.test(txt)) score += 80;
+                            else if (/top.?up/i.test(txt)) score += 60;
+                            else if (/deposit|pay/i.test(txt)) score += 40;
+                            else if (/submit|confirm/i.test(txt)) score += 20;
+                            // prefer real buttons / submits
+                            if (tag === 'button') score += 20;
+                            if (el.getAttribute('type') === 'submit') score += 20;
+                            if (el.getAttribute('role') === 'button') score += 10;
+                            // prefer elements lower in the viewport (form CTA usually is)
+                            score += Math.min(40, r.top / window.innerHeight * 40);
+                            // prefer larger buttons
+                            score += Math.min(15, (r.width * r.height) / 4000);
+                            out.push({
+                                tag, txt: txt.slice(0, 80), cls: cls.slice(0, 80),
+                                x: r.left + r.width / 2, y: r.top + r.height / 2,
+                                w: r.width, h: r.height, score,
+                            });
+                        } catch (e) {}
+                    }
+                    out.sort((a, b) => b.score - a.score);
+                    return out.slice(0, 5);
+                }"""
+            )
+            if best:
+                logger.info(f"  candidates ranked: {best}")
+                top = best[0]
+                logger.info(
+                    f"  clicking best candidate <{top['tag']}> "
+                    f"'{top['txt']}' at ({top['x']:.0f},{top['y']:.0f}) "
+                    f"score={top['score']:.0f}")
+                try:
+                    page.mouse.click(float(top["x"]), float(top["y"]),
+                                     delay=random.randint(40, 90))
+                except Exception as e:
+                    logger.debug(f"  heuristic mouse.click failed: {e}")
+                time.sleep(1.0)
+                post_state = _post_submit_state()
+                if _looks_submitted(post_state):
+                    logger.info(f"  -> heuristic click worked: {post_state}")
+                    btn_clicked = True
+        except Exception as e:
+            logger.debug(f"  heuristic-candidate evaluation failed: {e}")
+
+    # ---- Strategy 9: form.requestSubmit() - native submit event so Vue's
+    # @submit handler runs. Targets the form that contains the amount input.
+    if not btn_clicked:
+        logger.info("  strategy 9: form.requestSubmit() on the amount-input's form.")
+        try:
+            submitted = page.evaluate(
+                """() => {
+                    const inp = document.querySelector(
+                        "input[name='amount'], input[name='payment_amount'], input[type='number'], input.input__input");
+                    if (!inp) return { ok: false, reason: 'no amount input' };
+                    let f = inp.form;
+                    if (!f) {
+                        let p = inp.parentElement;
+                        while (p && p.tagName !== 'FORM') p = p.parentElement;
+                        f = p;
+                    }
+                    if (!f) return { ok: false, reason: 'no form ancestor' };
+                    inp.dispatchEvent(new Event('blur', { bubbles: true }));
+                    if (typeof f.requestSubmit === 'function') {
+                        f.requestSubmit();
+                        return { ok: true, used: 'requestSubmit' };
+                    }
+                    f.submit();
+                    return { ok: true, used: 'submit' };
+                }"""
+            )
+            logger.info(f"  form-submit result: {submitted}")
+            time.sleep(1.5)
+            post_state = _post_submit_state()
+            if _looks_submitted(post_state):
+                logger.info("  -> form.requestSubmit worked.")
+                btn_clicked = True
+        except Exception as e:
+            logger.debug(f"  form.requestSubmit failed: {e}")
+
+    # ---- Strategy 10: press Enter on the amount input (some Vue forms
+    # listen for keydown.enter to submit).
+    if not btn_clicked:
+        logger.info("  strategy 10: press Enter on the amount input.")
+        try:
+            for sel in ("input[name='amount']", "input[name='payment_amount']",
+                        "input[type='number']", "input.input__input:visible"):
+                try:
+                    loc = page.locator(sel).first
+                    loc.focus(timeout=2000)
+                    loc.press("Enter", timeout=3000)
+                    time.sleep(1.5)
+                    if _looks_submitted(_post_submit_state()):
+                        logger.info(f"  -> Enter-key on {sel} worked.")
+                        btn_clicked = True
+                        break
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.debug(f"  Enter-key strategy failed: {e}")
+
     if not btn_clicked:
         # Final safety net: maybe the click DID go through earlier in this
         # loop but every strategy raised before we noticed. Re-probe.
@@ -1726,7 +1901,9 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None,
     # seller URL, hoping Styx no longer issues the challenge.
     #
     # Recovery ladder (no re-login, no Continue click - per user spec):
-    #   1. page.go_back() then re-goto seller_url.
+    #   1. page.go_back() -> scroll to top -> click the big Styx logo
+    #      (warm-navigates to the homepage while keeping the session) ->
+    #      goto seller_url.
     #   2. goto the public catalog page, then re-goto seller_url.
     # If both fail we bail out and leave the browser open for manual handling.
     def _slider_or_login():
@@ -1746,6 +1923,93 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None,
             return True
         return _is_login_page(page)
 
+    def _click_styx_logo():
+        """Find & click the big Styx wordmark / logo in the top-left header
+        to navigate to the homepage while keeping the current session warm.
+
+        Returns True on a successful click that left the seller URL, False
+        otherwise. We pick the FIRST visible top-of-page anchor whose href
+        is the site root (/), whose alt/text/class hints at "logo" or
+        "styx", and which sits in the upper ~120px of the viewport.
+        """
+        try:
+            box = page.evaluate(
+                """() => {
+                    const norm = s => (s || '').toLowerCase();
+                    const cands = Array.from(document.querySelectorAll(
+                        'a[href="/"], a[href$="://styxmarket.si/"], a[href$="://styxmarket.si"], '
+                        + 'a[href$="://www.styxmarket.si/"], a[href$="://www.styxmarket.si"], '
+                        + 'a.logo, a[class*="logo" i], header a, nav a'
+                    ));
+                    let best = null;
+                    let bestScore = -1;
+                    for (const a of cands) {
+                        try {
+                            const r = a.getBoundingClientRect();
+                            if (r.width < 20 || r.height < 16) continue;
+                            if (r.top > 160 || r.left > window.innerWidth * 0.5) continue;
+                            const cs = getComputedStyle(a);
+                            if (cs.visibility === 'hidden' || cs.display === 'none'
+                                || parseFloat(cs.opacity) === 0) continue;
+                            let score = 0;
+                            const cls = norm(a.className && a.className.toString ? a.className.toString() : '');
+                            const txt = norm(a.innerText || a.textContent || '');
+                            const inner = norm(a.innerHTML || '');
+                            if (/logo/.test(cls)) score += 50;
+                            if (/styx/.test(txt)) score += 30;
+                            if (/styx/.test(inner)) score += 20;
+                            if (a.querySelector('img, svg')) score += 15;
+                            const href = (a.getAttribute('href') || '').toLowerCase();
+                            if (href === '/' || /styxmarket\\.si\\/?$/.test(href)) score += 40;
+                            // upper-left bias
+                            score += Math.max(0, 60 - r.top) * 0.5;
+                            score += Math.max(0, 100 - r.left) * 0.3;
+                            if (score > bestScore) {
+                                bestScore = score;
+                                best = { x: r.left + r.width / 2, y: r.top + r.height / 2,
+                                         href: href, score: score };
+                            }
+                        } catch (e) {}
+                    }
+                    return best;
+                }"""
+            )
+        except Exception as e:
+            logger.debug(f"  logo-locator JS failed: {e}")
+            return False
+
+        if not box:
+            logger.warning("  could not locate the Styx logo in the header.")
+            return False
+
+        logger.info(
+            f"  clicking Styx logo at ({box['x']:.0f}, {box['y']:.0f}) "
+            f"href={box.get('href')} score={box.get('score'):.0f}")
+        url_before = page.url
+        try:
+            page.mouse.click(float(box["x"]), float(box["y"]))
+        except Exception as e:
+            logger.debug(f"  mouse.click on logo failed: {e}")
+            return False
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=15000)
+        except Exception:
+            pass
+        time.sleep(random.uniform(1.0, 1.8))
+        try:
+            page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+        # Success if URL changed AND we are no longer on the slider/login.
+        moved = page.url != url_before
+        if moved and not _slider_or_login():
+            logger.success(f"  logo click navigated us to: {page.url}")
+            return True
+        logger.warning(
+            f"  logo click did not warm-navigate (url_before={url_before}, "
+            f"now={page.url}, slider/login={_slider_or_login()}).")
+        return False
+
     if _slider_or_login():
         logger.warning(
             "Quick verification slider (or login wall) detected on seller "
@@ -1764,13 +2028,46 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None,
         catalog_url = "https://www.styxmarket.si/shop/catalog/?vue=true"
         recovered = False
 
-        # Strategy 1: go_back, then re-goto seller_url.
-        logger.info("  recovery 1: page.go_back() -> re-goto seller_url.")
+        # Strategy 1: go_back to the deposit-success page, scroll to top,
+        # click the big Styx logo to warm-navigate to the homepage, then
+        # goto seller_url.
+        logger.info(
+            "  recovery 1: page.go_back() -> scroll top -> click Styx "
+            "logo -> goto seller_url.")
         try:
             page.go_back(wait_until="domcontentloaded", timeout=15000)
             time.sleep(random.uniform(1.5, 2.5))
         except Exception as e:
             logger.debug(f"  go_back failed: {e}")
+        # Scroll to the very top so the header (and the logo) is in view.
+        try:
+            page.evaluate(
+                "() => window.scrollTo({ top: 0, behavior: 'instant' })")
+        except Exception:
+            try:
+                page.evaluate("() => window.scrollTo(0, 0)")
+            except Exception as e:
+                logger.debug(f"  scroll-to-top after go_back failed: {e}")
+        time.sleep(random.uniform(0.6, 1.0))
+        if debug_dir:
+            try:
+                page.screenshot(
+                    path=os.path.join(debug_dir, "19a_after_goback.png"),
+                    full_page=False,
+                )
+            except Exception:
+                pass
+        # Click the big Styx logo -> homepage.
+        logo_ok = _click_styx_logo()
+        if debug_dir and logo_ok:
+            try:
+                page.screenshot(
+                    path=os.path.join(debug_dir, "19b_after_logo_click.png"),
+                    full_page=False,
+                )
+            except Exception:
+                pass
+        # Now navigate (paste + visit) the seller URL.
         try:
             page.goto(seller_url, wait_until="domcontentloaded", timeout=45000)
             try:
@@ -1779,18 +2076,19 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None,
                 pass
             time.sleep(random.uniform(1.5, 2.5))
         except Exception as e:
-            logger.debug(f"  re-goto seller_url after go_back failed: {e}")
+            logger.debug(f"  goto seller_url after logo click failed: {e}")
         if not _slider_or_login():
-            logger.success(f"  go_back recovery succeeded. URL: {page.url}")
+            logger.success(
+                f"  go_back+logo recovery succeeded. URL: {page.url}")
             recovered = True
         else:
             logger.warning(
-                "  go_back recovery did not clear the slider/login wall."
+                "  go_back+logo recovery did not clear the slider/login wall."
             )
             if debug_dir:
                 try:
                     page.screenshot(
-                        path=os.path.join(debug_dir, "19a_after_goback.png"),
+                        path=os.path.join(debug_dir, "19c_after_seller_goto.png"),
                         full_page=True,
                     )
                 except Exception:
@@ -1825,7 +2123,7 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None,
                 if debug_dir:
                     try:
                         page.screenshot(
-                            path=os.path.join(debug_dir, "19b_after_catalog.png"),
+                            path=os.path.join(debug_dir, "19d_after_catalog.png"),
                             full_page=True,
                         )
                     except Exception:
@@ -1833,9 +2131,10 @@ def do_buy_product(page, seller_url, product_name, debug_dir=None,
 
         if not recovered:
             logger.error(
-                "All recovery strategies (go_back, catalog-warm) failed. The "
-                "Quick verification slider / login wall is still showing. "
-                "The browser stays open so you can complete it manually."
+                "All recovery strategies (go_back+logo, catalog-warm) "
+                "failed. The Quick verification slider / login wall is "
+                "still showing. The browser stays open so you can "
+                "complete it manually."
             )
             return False
 
